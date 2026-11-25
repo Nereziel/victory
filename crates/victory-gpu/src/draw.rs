@@ -81,6 +81,18 @@ fn write_skip() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_SKIP").is_none_or(|v| v != "0"))
 }
 
+/// Opt in to narrower raw-memory write declarations; ordinary descriptor
+/// writes still use their existing synchronization. Leave the old behavior
+/// available while the address classification is validated on the title.
+fn memory_marks_by_address() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_MEMORY_DECLARE").is_some_and(|v| v == "address");
+        tracing::info!(enabled, "raw title memory: narrow write declarations");
+        enabled
+    })
+}
+
 /// A run of indirect records clamped in one pass ([`windows`]): the host
 /// copy they came from (its number), their kind and stride, the offset of
 /// the first in that copy, how many, and the list's scratch buffer that
@@ -987,7 +999,8 @@ impl State {
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let raw_writes = writes && (!write_skip() || !memory_marks_by_address() || t.stores_by_address);
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
