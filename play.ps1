@@ -15,7 +15,7 @@ param(
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
     [switch]$Warm,               # redo the shader warm-up even if this build already did it
-    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','HeapPlan','PipelineWindow','TextureIdle','TextureQueue','RyzenWorkers','Balanced','Combined')]
+    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','HeapPlan','PipelineWindow','TextureIdle','TextureQueue','RyzenWorkers','SmallBuffers','ChangedRuns','ResidentTextures','Balanced','Combined')]
     [string]$Benchmark = ''      # optional A/B test mode, one variable at a time
 )
 $ErrorActionPreference = 'Stop'
@@ -59,6 +59,8 @@ if ($Benchmark) {
     $env:VICTORY_HEAP_PLAN_REUSE = '0'
     $env:VICTORY_PIPELINE_WAIT_SHARED = 'reserve'
     $env:VICTORY_ADAPTIVE_TEXTURE_IDLE = '0'
+    $env:VICTORY_CHANGED_RUNS = '0'
+    Remove-Item Env:VICTORY_CARD_BUFFERS_MIN_KB -ErrorAction SilentlyContinue
     foreach ($key in @('VICTORY_WIDE_THREADS','VICTORY_TEXTURE_THREADS','VICTORY_TEXTURE_QUEUE_MB','VICTORY_TEXTURE_QUEUE_MS')) {
         Remove-Item "Env:$key" -ErrorAction SilentlyContinue
     }
@@ -79,6 +81,9 @@ if ($Benchmark) {
         $env:VICTORY_WIDE_THREADS = '6'
         $env:VICTORY_TEXTURE_THREADS = '4'
     }
+    if ($Benchmark -eq 'SmallBuffers') { $env:VICTORY_CARD_BUFFERS_MIN_KB = '64' }
+    if ($Benchmark -eq 'ChangedRuns') { $env:VICTORY_CHANGED_RUNS = '1' }
+    if ($Benchmark -eq 'ResidentTextures') { $env:VICTORY_REUPLOAD_WHEN_FULL = '1' }
     # Balanced keeps the original VRAM limits and wide-copy settings;
     # Combined additionally tests the older wide and card-window switches.
     Write-Host "Benchmark mode: $Benchmark"

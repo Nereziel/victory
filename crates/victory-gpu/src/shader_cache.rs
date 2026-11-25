@@ -84,8 +84,13 @@ fn build() -> &'static [u8; 32] {
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
+            // Unset and empty are distinct for presence-based switches.
+            // Adapted from fxceless/victory-fork#1132.
             if let Some(value) = std::env::var_os(name) {
+                hash.update(&[1]);
                 hash.update(value.as_encoded_bytes());
+            } else {
+                hash.update(&[0]);
             }
             hash.update(&[0]);
         }

@@ -151,7 +151,14 @@ fn card_limits() -> (u64, u64) {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        // fxceless c36971b2: optional sub-MiB buffers on the card.
+        // Preserve the old MiB default and the existing allocation budget.
+        let least = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .map_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20),
+                |v| v.clamp(64, 1 << 20) << 10);
+        (least, mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
@@ -1448,6 +1455,15 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *WIDE.get_or_init(|| std::env::var_os("VICTORY_CHANGED_RUNS").is_some_and(|v| v == "1")) {
+        changed_runs_wide(now, was)
+    } else {
+        changed_runs_bytes(now, was)
+    }
+}
+
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -1471,9 +1487,114 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+// Exact SSE2 mask walk, adapted from fxceless/victory-fork c36971b2.
+#[cfg(target_arch = "x86_64")]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use core::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
+    let n = now.len().min(was.len());
+    let (now, was) = (&now[..n], &was[..n]);
+    let mut runs = Vec::with_capacity(64);
+    // The first byte of a run not yet ended.
+    let mut open: Option<usize> = None;
+    let mut base = 0;
+    while base + 64 <= n {
+        // Bit `k`: byte `base + k` differs.
+        let mut differ = 0u64;
+        for part in 0..4 {
+            let at = base + 16 * part;
+            // SAFETY: `at + 16 <= base + 64 <= n`, the length of both
+            // slices; the loads are unaligned ones. SSE2 is part of x86-64.
+            let equal = unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(at).cast::<__m128i>());
+                let b = _mm_loadu_si128(was.as_ptr().add(at).cast::<__m128i>());
+                _mm_movemask_epi8(_mm_cmpeq_epi8(a, b)) as u32 & 0xffff
+            };
+            differ |= u64::from(!equal & 0xffff) << (16 * part);
+        }
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, base - first));
+            }
+        } else if differ != u64::MAX || open.is_none() {
+            let mut at = 0u32;
+            while at < 64 {
+                match open {
+                    None => {
+                        // The next byte that differs, if any.
+                        let skip = (differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        open = Some(base + at as usize);
+                    }
+                    Some(first) => {
+                        // The next byte that is equal, if any.
+                        let skip = (!differ >> at).trailing_zeros();
+                        if skip >= 64 - at {
+                            break;
+                        }
+                        at += skip;
+                        runs.push((first, base + at as usize - first));
+                        open = None;
+                    }
+                }
+            }
+        }
+        base += 64;
+    }
+    for i in base..n {
+        match (open, now[i] != was[i]) {
+            (None, true) => open = Some(i),
+            (Some(first), false) => {
+                runs.push((first, i - first));
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_bytes(now, was)
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, changed_runs_bytes, changed_runs_wide};
+
+    #[test]
+    fn wide_runs_match_scalar_for_unaligned_and_mixed_lengths() {
+        let mut state = 0x1234_5678u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        };
+        for len in [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 127, 128, 129, 511, 4096, 65537] {
+            for offset in [0, 1, 7, 15, 31] {
+                for density in [0, 1, 32, 128, 255, 256] {
+                    let was: Vec<u8> = (0..len + offset + 3).map(|_| next()).collect();
+                    let mut now = was.clone();
+                    for b in &mut now[offset..offset + len] {
+                        if u16::from(next()) < density {
+                            *b ^= next() | 1;
+                        }
+                    }
+                    let a = &now[offset..offset + len];
+                    let b = &was[offset..offset + len + 3];
+                    assert_eq!(changed_runs_wide(a, b), changed_runs_bytes(a, b));
+                    assert_eq!(changed_runs_wide(b, a), changed_runs_bytes(b, a));
+                }
+            }
+        }
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
