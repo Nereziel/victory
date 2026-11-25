@@ -10,6 +10,7 @@ param(
     [switch]$Perf,               # use target\perf (ThinLTO performance build)
     [switch]$FSR,                # optional PC FidelityFX SDK upscaler
     [switch]$NoFSR,              # restore original linear upscale
+    [switch]$NoIndirectWindow,   # diagnose missing geometry with per-record clamping
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -39,7 +40,7 @@ if (-not (Test-Path $exe)) {
 $env:VICTORY_DISPLAY_MODE        = '1280x720'   # indoor walls draw with this
 $env:VICTORY_SHADER_LOOP_LIMIT   = '256'        # without it the GPU hangs in the open world
 $env:VICTORY_RELAY               = '2'
-$env:VICTORY_INDIRECT_WINDOW     = '1'          # if the game loses the GPU, remove this first
+$env:VICTORY_INDIRECT_WINDOW     = if ($NoIndirectWindow) { '0' } else { '1' }
 $env:VICTORY_LATE_WAIT           = '3'
 $env:VICTORY_WIDE_BACK           = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
