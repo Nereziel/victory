@@ -691,6 +691,15 @@ impl Lane {
         }
     }
 
+    /// A page list may still be filled by the title between enqueue and
+    /// submit. Keep it (and following statuses) until the explicit submit,
+    /// unless the queue would otherwise block the producer.
+    fn auto_submit(&self, snapshot: bool) -> bool {
+        self.unsubmitted.len() >= (self.capacity / 2).max(1)
+            && !(snapshot && self.unsubmitted.iter().any(|c|
+                matches!(c, Command::Read(r) if r.options & PAGE_DESTINATION != 0)))
+    }
+
     /// Requests and status entries held, submitted or not.
     fn entries(&self) -> usize {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
@@ -859,8 +868,9 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     queue(this, Command::Status(Status { array, index }));
 }
 
-/// Adds a command to the queue; blocks while the queue is full, and
-/// submits on its own once half of it is enqueued, as the console does.
+/// Adds a command to the queue; submits on its own at half capacity
+/// except when submit-time page lists need to wait for the title.
+/// A full queue must still make progress.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
@@ -876,6 +886,13 @@ fn queue(this: QueueRef, command: Command) {
         if lane.entries() + 1 < lane.capacity.max(2) {
             break;
         }
+        if !lane.unsubmitted.is_empty() {
+            tracing::warn!(commands = lane.unsubmitted.len(),
+                "dstorage: full queue forces submission before explicit submit");
+            lanes.submit_with_pages(id, true);
+            scheduler.work.notify_all();
+            continue;
+        }
         lanes = scheduler
             .finished
             .wait(lanes)
@@ -885,7 +902,7 @@ fn queue(this: QueueRef, command: Command) {
         return;
     };
     lane.unsubmitted.push(command);
-    if lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if lane.auto_submit(snapshot_at_submit()) {
         lanes.submit(id);
         scheduler.work.notify_all();
     }
@@ -912,12 +929,17 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-// Adapted from KLBF Lab's submit-time page resolution. Only explicit
-// submits are changed; automatic submission and unresolved lists keep
-// the old late path to avoid blocking a title that fills a whole queue.
+// Submit-time page resolution from KLBF Lab (JappertjeV), with Vertex
+// 8b2d063's queue policy. Hold page destinations until submit by default.
+// VICTORY_PAGE_LIST=late restores the previous half-queue/worker-time path.
+// Unresolved lists still fall back to the worker's late resolution.
 fn snapshot_at_submit() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_LIST").is_some_and(|v| v == "submit"))
+    *ON.get_or_init(|| {
+        let enabled = std::env::var_os("VICTORY_PAGE_LIST").is_none_or(|v| v != "late");
+        tracing::info!(enabled, "dstorage: submit-time page lists");
+        enabled
+    })
 }
 
 fn resolve_destination(request: &Request) -> Option<super::xmem::PageRuns> {
@@ -1474,6 +1496,28 @@ mod tests {
         assert_eq!(result(array, 1), S_OK);
         assert_eq!(buffers[2], contents[100..116]);
         assert_eq!(buffers[3], contents[..16]);
+    }
+
+    #[test]
+    fn page_destinations_wait_for_explicit_submit() {
+        let mut lane = Lane::new(0, 4);
+        let read = |options| Command::Read(request(
+            options, std::ptr::null_mut(), PAGE, std::ptr::null(), 0, PAGE,
+        ));
+        lane.unsubmitted.push(read(0));
+        assert!(!lane.auto_submit(true));
+        lane.unsubmitted.push(read(0));
+        assert!(lane.auto_submit(true));
+        lane.unsubmitted.push(read(PAGE_DESTINATION));
+        assert!(!lane.auto_submit(true));
+        assert!(lane.auto_submit(false));
+        // Full-queue progress is handled separately from the half-queue rule.
+        assert_eq!(lane.entries() + 1, lane.capacity);
+        let mut l = lanes(0);
+        l.lanes.insert(0, lane);
+        l.submit_with_pages(0, true);
+        assert!(l.lanes[&0].unsubmitted.is_empty());
+        assert_eq!(l.lanes[&0].reads.len(), 3);
     }
 
     #[test]
