@@ -1630,7 +1630,7 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<_> = self
                     .x
                     .res
                     .scalar
@@ -1643,9 +1643,9 @@ impl<'a> Lower<'a> {
                         })
                     }))
                     .filter(|a| a.param == CODE)
-                    .map(|a| a.offset & !3)
-                    .min()
-                    .ok_or("a code table")?;
+                    .collect();
+                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest, self.x.native.code.len());
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -10977,15 +10977,61 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
     })
 }
 
+/// VIctory #2143: constants normally follow the program's instructions.
+/// Do not duplicate instruction words in the host constant array merely
+/// because a computed load is based at an earlier program counter.
+/// Retain the old start for a known fixed read inside the instructions
+/// or when there is no trailing table to use.
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[crate::resource::Address],
+    lowest: u32,
+    code_len: usize,
+) -> u32 {
+    let code_end = p.blocks.iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    if code_end as usize >= code_len
+        || addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end)
+    {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn code_table_skips_instructions_unless_a_fixed_load_reads_them() {
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let computed = at(0, true);
+        let after = at(12, false);
+        let inside = at(4, false);
+        assert_eq!(code_table_start(&p, &[computed], 0, code.len()), 8);
+        assert_eq!(code_table_start(&p, &[computed, after], 0, code.len()), 8);
+        assert_eq!(code_table_start(&p, &[computed, inside], 0, code.len()), 0);
+        assert_eq!(code_table_start(&p, &[after], 12, code.len()), 12);
+        assert_eq!(code_table_start(&p, &[computed], 0, 8), 0);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
