@@ -59,6 +59,9 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// Last fully scanned write-watch epoch for a placed shader-visible heap.
+    #[cfg(windows)]
+    sync_epoch: std::sync::Mutex<u64>,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -153,6 +156,78 @@ fn mirror(handle: u64) {
             }
         }
     }
+}
+
+/// Mirror descriptors copied as ordinary CPU bytes rather than through
+/// Create*View or CopyDescriptors. Reuse the shared write-watch journal so
+/// resetting Windows' dirty bits cannot hide writes from other host copies.
+/// Adapted from VIctory 86a5ed6 / Neptune; only write-watched placed heaps
+/// are scanned. The caller must have no GPU submissions in flight.
+#[cfg(windows)]
+pub(crate) fn sync_heaps() {
+    if !host::heap_sync_enabled() {
+        return;
+    }
+    crate::zone!("descriptor heap sync");
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut bytes = Vec::new();
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: the registry lock prevents removal of the heap.
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.memory.is_some() {
+            continue;
+        }
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue;
+        };
+        let step = step as usize;
+        let start = start as usize;
+        let count = heap.desc.count.min(host.count()) as usize;
+        if count == 0 {
+            continue;
+        }
+        let end = start + count * step;
+        let mut epoch = heap.sync_epoch.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((now, pages)) = crate::watch::writes(start, end, false) else {
+            continue;
+        };
+        let mut complete = true;
+        for (page, written) in pages {
+            if written <= *epoch {
+                continue;
+            }
+            let (first, last) = sync_slots(start, end, step, page);
+            if first >= last {
+                continue;
+            }
+            // Snapshot through the kernel: placed heaps may be unmapped by
+            // another title thread. Read whole slots even at a page edge.
+            let from = start + first * step;
+            bytes.resize((last - first) * step, 0);
+            if !crate::host::read_into(from as *const u8, &mut bytes) {
+                complete = false;
+                continue;
+            }
+            for (i, slot) in bytes.chunks_exact(step).enumerate() {
+                let record = [0, 4, 8].map(|offset| {
+                    u32::from_le_bytes(slot[offset..offset + 4].try_into().expect("descriptor word"))
+                });
+                let index = first + i;
+                host.mirror_copied(index as u32, (start + index * step) as u64, record);
+            }
+        }
+        // Failed snapshots are retried; never consume their dirty epoch.
+        if complete {
+            *epoch = (*epoch).max(now);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_slots(start: usize, end: usize, step: usize, page: usize) -> (usize, usize) {
+    let from = (page * crate::watch::PAGE).clamp(start, end);
+    let to = ((page + 1) * crate::watch::PAGE).clamp(start, end);
+    ((from - start) / step, (to - start).div_ceil(step))
 }
 
 /// Gives back dynamic slots of the host heap behind the title heap at
@@ -947,6 +1022,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        sync_epoch: Default::default(),
     });
     #[cfg(windows)]
     if visible {
@@ -1028,6 +1105,17 @@ mod tests {
         assert_eq!(increment_size(null, 9), 0);
         let bad = HeapDesc { kind: 9, ..desc };
         assert_eq!(create(bad, none, &mut h), E_INVALIDARG);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copied_heap_pages_cover_partial_slots_and_respect_heap_cap() {
+        let page = crate::watch::PAGE;
+        let start = page - 8;
+        let end = start + 64 * 32;
+        assert_eq!(sync_slots(start, end, 32, 0), (0, 1));
+        assert_eq!(sync_slots(start, end, 32, 1), (0, 64));
+        assert_eq!(sync_slots(start, end, 32, 2), (64, 64));
     }
 
     #[test]
