@@ -64,6 +64,8 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
+pub mod ffx;
+#[cfg(windows)]
 mod upscale;
 #[cfg(windows)]
 mod fps_overlay;
