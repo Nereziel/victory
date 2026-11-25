@@ -17,7 +17,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -441,8 +440,47 @@ impl Scheduler {
     }
 }
 
+/// Each worker owns its temporary buffers; no shared allocator lock or
+/// cross-request borrowing. Retain only small allocations when opted in.
+#[derive(Default)]
+struct Scratch {
+    source: Vec<u8>,
+    intermediate: Vec<u8>,
+    destination: Vec<u8>,
+}
+
+fn scratch_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_SCRATCH_KB").ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0).min(1024) << 10
+    })
+}
+
+fn prepare_scratch(buf: &mut Vec<u8>, len: usize) -> Result<&mut [u8], HRESULT> {
+    buf.clear();
+    buf.try_reserve_exact(len).map_err(|_| E_OUTOFMEMORY)?;
+    // Preserve zero-initialization of the old temporary allocations.
+    buf.resize(len, 0);
+    Ok(buf.as_mut_slice())
+}
+
+impl Scratch {
+    fn release_large(&mut self, limit: usize) {
+        for buf in [&mut self.source, &mut self.intermediate, &mut self.destination] {
+            if buf.capacity() > limit {
+                *buf = Vec::new();
+            } else {
+                buf.clear();
+            }
+        }
+    }
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    let mut scratch = Scratch::default();
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -451,7 +489,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request, job.pages.as_ref());
+        let result = execute(&job.request, job.pages.as_ref(), &mut scratch);
+        scratch.release_large(scratch_limit());
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -827,7 +866,7 @@ fn resolve_destination(request: &Request) -> Option<super::xmem::PageRuns> {
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request, pages: Option<&super::xmem::PageRuns>) -> Result<(), HRESULT> {
+fn execute(request: &Request, pages: Option<&super::xmem::PageRuns>, scratch: &mut Scratch) -> Result<(), HRESULT> {
     victory_gpu::zone!("dstorage request");
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
@@ -857,28 +896,28 @@ fn execute(request: &Request, pages: Option<&super::xmem::PageRuns>) -> Result<(
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, pages, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, pages, size, &mut scratch.destination, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, &mut scratch.source).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
-        let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
-        packed.truncate(n);
-        Cow::Owned(packed)
+        let packed = prepare_scratch(&mut scratch.intermediate, request.intermediate_size as usize)
+            .map_err(|hr| fail(hr, "allocating intermediate buffer"))?;
+        let n = inflate(source, packed).map_err(|hr| fail(hr, "zlib"))?;
+        &packed[..n]
     } else {
         source
     };
-    into_destination(request, pages, size, |out| match tables {
+    into_destination(request, pages, size, &mut scratch.destination, |out| match tables {
         Some(tables) => {
             victory_gpu::zone!("bcpack decode");
-            bcpack::decode(bc, &source, out, tables)
+            bcpack::decode(bc, source, out, tables)
                 .map(|()| out.len())
                 .map_err(|e| fail(INVALID_DATA, &e.to_string()))
         }
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        None => inflate(source, out).map_err(|hr| fail(hr, "zlib")),
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -943,16 +982,15 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source<'a>(request: &'a Request, scratch: &'a mut Vec<u8>) -> Result<&'a [u8], HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(unsafe { std::slice::from_raw_parts(request.source.cast(), size) });
     }
-    let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    let bytes = prepare_scratch(scratch, size)?;
+    read_into(request, bytes)?;
+    Ok(bytes)
 }
 
 /// Nanoseconds workers spent reading files, for the debug summary.
@@ -964,6 +1002,9 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
+    }
+    if request.offset.checked_add(out.len() as u64).is_none() {
+        return Err(E_INVALIDARG);
     }
     // SAFETY: a file object we created; the title keeps it open.
     let file = &unsafe { &*request.source.cast::<Instance<File>>() }
@@ -994,6 +1035,7 @@ fn into_destination(
     request: &Request,
     resolved: Option<&super::xmem::PageRuns>,
     len: usize,
+    scratch: &mut Vec<u8>,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
@@ -1009,8 +1051,8 @@ fn into_destination(
         if let Some(mut window) = runs.window() {
             return fill(window.bytes()).map(drop);
         }
-        let mut data = vec![0; len];
-        let n = fill(&mut data)?;
+        let data = prepare_scratch(scratch, len)?;
+        let n = fill(data)?;
         return if runs.write(&data[..n]) { Ok(()) } else { Err(E_INVALIDARG) };
     }
     let offset = (request.page_offset & 0xffff) as usize;
@@ -1020,8 +1062,8 @@ fn into_destination(
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
         return fill(window.bytes()).map(drop);
     }
-    let mut data = vec![0; len];
-    let n = fill(&mut data)?;
+    let data = prepare_scratch(scratch, len)?;
+    let n = fill(data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
@@ -1098,6 +1140,22 @@ pub(crate) fn module() -> HleModule {
         dlls: &["xcrdapi.dll"],
         exports: vec![hle_export!(DStorageGetFactory)],
     }
+}
+
+#[cfg(test)]
+#[test]
+fn worker_scratch_is_zeroed_and_retention_is_bounded() {
+    let mut scratch = Scratch::default();
+    prepare_scratch(&mut scratch.source, 32).unwrap().fill(0xaa);
+    let ptr = scratch.source.as_ptr();
+    scratch.release_large(1024);
+    assert_eq!(prepare_scratch(&mut scratch.source, 16).unwrap(), &[0; 16]);
+    assert_eq!(scratch.source.as_ptr(), ptr);
+    prepare_scratch(&mut scratch.intermediate, 2048).unwrap();
+    scratch.release_large(1024);
+    assert_eq!(scratch.intermediate.capacity(), 0);
+    scratch.release_large(0);
+    assert_eq!(scratch.source.capacity(), 0);
 }
 
 #[cfg(test)]
