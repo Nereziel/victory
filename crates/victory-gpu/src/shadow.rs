@@ -1085,7 +1085,12 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let available = std::thread::available_parallelism().map_or(16, |n| n.get());
+        // Neptune exposes the wide worker count. Do not oversubscribe the
+        // host with its 12-worker preset: leave capacity for title threads.
+        let n = std::env::var("VICTORY_WIDE_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or_else(|| (available / 4).clamp(2, 6), |n| n.clamp(1, available.saturating_sub(2).clamp(1, 12)));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
