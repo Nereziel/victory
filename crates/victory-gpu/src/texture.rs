@@ -1173,7 +1173,11 @@ pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
         let _mapped = (!sharded).then(|| waited(2, crate::watch::title_memory_reading));
         // The wait is every texture's, as it was when each took the lock.
         REFRESH_WAITS[3].fetch_add(held.elapsed().as_micros() as u64, Relaxed);
-        let spare = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 12);
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        static THREADS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let requested = *THREADS.get_or_init(|| std::env::var("VICTORY_TEXTURE_THREADS")
+            .ok().and_then(|v| v.parse::<usize>().ok()));
+        let spare = requested.unwrap_or(available / 2).clamp(1, available.min(12));
         let threads = waiting.len().div_ceil(4).min(spare);
         BATCHES[0].fetch_add(1, Relaxed);
         BATCHES[1].fetch_add(waiting.len() as u64, Relaxed);
