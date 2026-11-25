@@ -265,12 +265,54 @@ pub(crate) fn warm(shaders: Vec<Arc<Shader>>) -> Option<bool> {
     Some(HostPipeline::new(&p.shaders, None).is_some())
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// Bound speculative mesh prewarming separately from the recorded
+/// early list. The latter and actual draw requests keep their priority.
+fn mesh_warm_limit() -> u64 {
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let n = std::env::var("VICTORY_MESH_PREWARM")
+            .ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(512);
+        if n != 0 {
+            tracing::info!(limit = n, "speculative mesh pipeline prewarming");
+        }
+        n
+    })
+}
+
+const MESH_WARM_BACKLOG: u64 = 16;
+static MESH_WARMED: AtomicU64 = AtomicU64::new(0);
+
+fn claim_mesh_warm(used: &AtomicU64, limit: u64, backlog: u64) -> bool {
+    if limit == 0 || backlog >= MESH_WARM_BACKLOG {
+        return false;
+    }
+    used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+        (n < limit).then(|| n + 1)
+    }).is_ok()
+}
+
+/// At creation, start pipelines requested in a previous run. Optionally
+/// enqueue a bounded number of unseen mesh pipelines on the same workers,
+/// but never ahead of recorded early work or actual draw requests.
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.left_out.is_none() && !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.left_out.is_some() || p.shaders.is_empty() {
+        return;
+    }
+    if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
+    } else if p.shaders.iter().any(|s| s.stage == "mesh")
+        && mesh_warm_limit() != 0
+        && workers()
+    {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if p.queue_state.load(Ordering::Relaxed) == NOT_QUEUED
+            && claim_mesh_warm(&MESH_WARMED, mesh_warm_limit(), waiting())
+        {
+            let _ = queue.push(p, SPECULATIVE);
+            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            AVAILABLE.notify_one();
+        }
     }
 }
 
@@ -433,11 +475,13 @@ fn wait(p: &Pending, frame: u64) {
 }
 
 const NOT_QUEUED: u8 = 0;
-const EARLY: u8 = 1;
-const REQUESTED: u8 = 2;
-const MAKING: u8 = 3;
+const SPECULATIVE: u8 = 1;
+const EARLY: u8 = 2;
+const REQUESTED: u8 = 3;
+const MAKING: u8 = 4;
 
 struct Queue {
+    speculative: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
 }
@@ -445,6 +489,7 @@ struct Queue {
 impl Queue {
     const fn new() -> Self {
         Self {
+            speculative: VecDeque::new(),
             early: VecDeque::new(),
             requested: VecDeque::new(),
         }
@@ -460,8 +505,10 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
             self.requested.push_back(p.clone());
-        } else {
+        } else if priority == EARLY {
             self.early.push_back(p.clone());
+        } else {
+            self.speculative.push_back(p.clone());
         }
         Some(prev == NOT_QUEUED)
     }
@@ -471,6 +518,9 @@ impl Queue {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        }).or_else(|| {
+            std::iter::from_fn(|| self.speculative.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == SPECULATIVE)
         })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
@@ -558,6 +608,7 @@ fn drained() {
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            speculative_mesh = MESH_WARMED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
     }
@@ -594,6 +645,28 @@ mod tests {
         assert!(ready(&p).is_none());
         assert!(p.made.get().is_none());
         assert!(super::super::library::wanted_early(&p.key));
+    }
+
+    #[test]
+    fn speculative_mesh_work_is_bounded_and_lowest_priority() {
+        let used = AtomicU64::new(0);
+        assert!(!claim_mesh_warm(&used, 0, 0));
+        assert!(!claim_mesh_warm(&used, 2, MESH_WARM_BACKLOG));
+        assert!(claim_mesh_warm(&used, 2, 0));
+        assert!(claim_mesh_warm(&used, 2, 0));
+        assert!(!claim_mesh_warm(&used, 2, 0));
+        let speculative = Arc::new(Pending::new(Vec::new(), None));
+        let promoted = Arc::new(Pending::new(Vec::new(), None));
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&speculative, SPECULATIVE), Some(true));
+        assert_eq!(queue.push(&promoted, SPECULATIVE), Some(true));
+        assert_eq!(queue.push(&early, EARLY), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &speculative));
+        assert!(queue.pop().is_none());
     }
 
     #[test]
