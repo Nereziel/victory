@@ -394,6 +394,7 @@ thread_local! {
 }
 
 /// Names the pipeline whose records this thread clamps next.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn tag(of: u32) {
     TAG.with(|t| t.set(of));
 }
