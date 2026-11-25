@@ -424,6 +424,56 @@ pub(crate) fn twin_plane_resource<'a>(
         .map(|p| unsafe { &*std::ptr::from_ref(&p.texture) })
 }
 
+/// Stencil copies share a scratch size class when explicitly enabled.
+/// Every recorded copy transitions COMMON -> COPY_DEST -> COPY_SOURCE
+/// -> COMMON; the host executes these lists on its single direct queue.
+/// Keep classes bounded so an unusually large texture does not pin a
+/// large extra allocation for the rest of the run.
+#[cfg(any(windows, test))]
+fn twin_scratch_class(bytes: u64) -> Option<u64> {
+    if bytes == 0 {
+        return None;
+    }
+    bytes.max(64 << 10).checked_next_power_of_two().filter(|&n| n <= 64 << 20)
+}
+
+#[cfg(windows)]
+fn twin_scratch(bytes: u64) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    struct Scratch(Vec<(u64, ID3D12Resource)>);
+    // SAFETY: D3D12 resources are free-threaded and the registry is locked.
+    unsafe impl Send for Scratch {}
+    static ALL: std::sync::Mutex<Scratch> = std::sync::Mutex::new(Scratch(Vec::new()));
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let host = crate::host::host()?;
+    let shared = *ON.get_or_init(|| std::env::var_os("VICTORY_TWIN_SCRATCH").is_some_and(|v| v == "1"));
+    if shared && let Some(class) = twin_scratch_class(bytes) {
+        let mut all = ALL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, buffer)) = all.0.iter().find(|(n, _)| *n == class) {
+            return Some(buffer.clone());
+        }
+        if let Some(buffer) = host.uav_buffer(class) {
+            crate::host::name(&buffer, || format!("shared stencil twin scratch {class:#x}"));
+            all.0.push((class, buffer.clone()));
+            tracing::info!(bytes = class, "shared stencil twin scratch allocated");
+            return Some(buffer);
+        }
+    }
+    // If a rounded class cannot be allocated, retain the old exact-size path.
+    host.uav_buffer(bytes)
+}
+
+#[cfg(test)]
+#[test]
+fn twin_scratch_classes_are_bounded() {
+    assert_eq!(twin_scratch_class(0), None);
+    assert_eq!(twin_scratch_class(1), Some(64 << 10));
+    assert_eq!(twin_scratch_class((64 << 10) + 1), Some(128 << 10));
+    assert_eq!(twin_scratch_class(64 << 20), Some(64 << 20));
+    assert_eq!(twin_scratch_class((64 << 20) + 1), None);
+    assert_eq!(twin_scratch_class(u64::MAX), None);
+}
+
 /// The colour twin for a texture described by `desc` whose host copy is
 /// `depth`, if the title asks for depth and unordered access both and the
 /// host can copy between the two: the same size, mips and slices in the
@@ -524,7 +574,7 @@ fn twin_texture(
                 Some(&mut bytes),
             );
         }
-        let Some(buffer) = host.uav_buffer(bytes) else {
+        let Some(buffer) = twin_scratch(bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
         };
