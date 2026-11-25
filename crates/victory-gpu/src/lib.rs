@@ -37,6 +37,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod inplace;
 pub mod list;
 pub mod object;
