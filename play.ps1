@@ -10,7 +10,7 @@ param(
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
     [switch]$Warm,               # redo the shader warm-up even if this build already did it
-    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','Combined')]
+    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','HeapPlan','PipelineWindow','Balanced','Combined')]
     [string]$Benchmark = ''      # optional A/B test mode, one variable at a time
 )
 $ErrorActionPreference = 'Stop'
@@ -49,12 +49,18 @@ if ($Benchmark) {
     $env:VICTORY_CARD_WINDOWS_MB = '0'
     $env:VICTORY_GPU_UPLOAD_SCRATCH = '0'
     $env:VICTORY_MAPPING_SHARDS = '0'
-    if ($Benchmark -in @('AVX2','Combined')) { $env:VICTORY_AVX2_MERGE = '1' }
+    $env:VICTORY_HEAP_PLAN_REUSE = '0'
+    $env:VICTORY_PIPELINE_WAIT_SHARED = 'reserve'
+    if ($Benchmark -in @('AVX2','Balanced','Combined')) { $env:VICTORY_AVX2_MERGE = '1' }
     if ($Benchmark -in @('WideMerge','Combined')) { $env:VICTORY_WIDE_MERGE = '1' }
     if ($Benchmark -in @('WideRefresh','Combined')) { $env:VICTORY_WIDE_REFRESH = '1' }
     if ($Benchmark -in @('CardWindows','Combined')) { $env:VICTORY_CARD_WINDOWS_MB = '1024' }
-    if ($Benchmark -in @('ReBAR','Combined')) { $env:VICTORY_GPU_UPLOAD_SCRATCH = '1' }
-    if ($Benchmark -in @('MappingShards','Combined')) { $env:VICTORY_MAPPING_SHARDS = '1' }
+    if ($Benchmark -in @('ReBAR','Balanced','Combined')) { $env:VICTORY_GPU_UPLOAD_SCRATCH = '1' }
+    if ($Benchmark -in @('MappingShards','Balanced','Combined')) { $env:VICTORY_MAPPING_SHARDS = '1' }
+    if ($Benchmark -in @('HeapPlan','Balanced','Combined')) { $env:VICTORY_HEAP_PLAN_REUSE = '1' }
+    if ($Benchmark -in @('PipelineWindow','Balanced','Combined')) { $env:VICTORY_PIPELINE_WAIT_SHARED = 'window' }
+    # Balanced keeps the original VRAM limits and wide-copy settings;
+    # Combined additionally tests the older wide and card-window switches.
     Write-Host "Benchmark mode: $Benchmark"
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
