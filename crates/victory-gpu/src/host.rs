@@ -4874,7 +4874,7 @@ impl Host {
                 }
                 let frame = crate::queue::frame_count();
                 if let Some(dir) = timing_dump()
-                    && frame % 20 == 0
+                    && frame.is_multiple_of(20)
                     && let Ok(mut file) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
