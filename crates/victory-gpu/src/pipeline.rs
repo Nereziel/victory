@@ -138,6 +138,8 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         stage,
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
+        // Warm-up never records title dispatches.
+        resolves_light: false,
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
