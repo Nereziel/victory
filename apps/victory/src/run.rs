@@ -122,6 +122,18 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // Move potentially slow driver-cache initialization outside title startup
+    // (adapted from skornuta/victory-fork 01f206b, Proudnoob4). The same
+    // OnceLock-backed device is reused when D3D12.X first needs it.
+    if std::env::var_os("VICTORY_HOST_EARLY").is_none_or(|v| v != "0") {
+        let started = std::time::Instant::now();
+        let adapter = victory_hle::modules::d3d12x::host_adapter();
+        tracing::info!(
+            ms = started.elapsed().as_millis() as u64,
+            adapter = ?adapter,
+            "host D3D12 initialization before title startup"
+        );
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
