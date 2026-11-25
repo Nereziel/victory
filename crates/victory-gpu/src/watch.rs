@@ -327,6 +327,15 @@ fn ahead_answer(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usi
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_impl(start, end, guarded, true)
+}
+
+/// Skip a known failed kernel query, but use the same guard journal.
+pub(crate) fn guard_writes(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_impl(start, end, true, false)
+}
+
+fn writes_impl(start: usize, end: usize, guarded: bool, kernel: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     crate::zone!("write watch");
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
@@ -348,24 +357,30 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         }
         return Some(answer);
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    let mut count = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    #[cfg(feature = "diagnostics")]
-    kernel_asked(failed, started.elapsed().as_micros() as u64);
+    let failed = if kernel {
+        count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        #[cfg(feature = "diagnostics")]
+        kernel_asked(failed, started.elapsed().as_micros() as u64);
+        failed
+    } else {
+        true
+    };
     let guarded = if failed {
         count = 0;
         if !guarded {
