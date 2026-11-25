@@ -54,6 +54,13 @@ static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 static const uint SPLIT = 2;
+
+// The title leaves unfilled mesh argument slots as all ones. Reject
+// this exact impossible triplet even when the draw is not speculative.
+bool mesh_unfilled(uint3 g) {
+    return all(g == uint3(0xffffffffu, 0xffffffffu, 0xffffffffu));
+}
+
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -116,7 +123,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        if (mesh_unfilled(g) || (ahead && g.x > 65535u)) {
             g = uint3(0, 0, 0);
         }
         // Diagnostics, in the budget buffer's next words: the largest
@@ -201,6 +208,7 @@ void mesh_batch(uint lane : SV_GroupIndex) {
     uint active = min(count_buf.Load(0), uint(MESH_BATCH_SIZE));
     if (lane < active) {
         uint3 raw = src_args.Load3(count_buf.Load(4 + lane * 4));
+        if (mesh_unfilled(raw)) raw = uint3(0, 0, 0);
         mesh_requested[lane] = raw.x;
         mesh_args[lane] = min(raw, uint3(65535u, 1u, 1u));
     }
@@ -1524,18 +1532,12 @@ void main() {
                 assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
-            if ahead {
-                for i in filled.len()..RECORDS as usize {
-                    assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
-                    assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
-                }
-                assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
-                assert_eq!(largest, 519, "and are not counted as asked for");
-            } else {
-                // Thirteen slots at 65,535 groups: sixteen would be all of it.
-                assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
-                assert_eq!(largest, u32::MAX);
+            for i in filled.len()..RECORDS as usize {
+                assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty, ahead {ahead}");
+                assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
+            assert_eq!(spent, charged_filled, "unfilled slots charge nothing, ahead {ahead}");
+            assert_eq!(largest, 519, "and are not counted as asked for");
         }
     }
 
@@ -1573,20 +1575,22 @@ void main() {
         // SAFETY: these are the actual commands, in title recording order.
         // The list has not run yet and must see the completed offsets.
         unsafe {
-            offsets.cast::<[u32; 4]>().write([3, 48, 16, 80]);
+            // An explicitly requested, unwritten all-ones record must
+            // not consume the remaining budget before the valid draws.
+            offsets.cast::<[u32; 5]>().write([4, 0, 48, 16, 80]);
             done_on(&warp.list, &dst);
             warp.list.Barred(&[transition(
                 &dst,
                 D3D12_RESOURCE_STATE_COMMON,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            warp.list.CopyBufferRegion(&readback, 0, &dst, 0, 36);
+            warp.list.CopyBufferRegion(&readback, 0, &dst, 0, 48);
         }
         warp.submit_and_wait();
         // SAFETY: the fence has completed, and the mapped buffers are live.
         unsafe {
-            assert_eq!(output.cast::<[u32; 9]>().read(), [2, 1, 1, 0, 0, 0, 0, 0, 1]);
-            assert_eq!(budget.cast::<[u32; 8]>().read(), [1 << 27, 3, 5, 3, 2, 0, 0, 1]);
+            assert_eq!(output.cast::<[u32; 12]>().read(), [0, 0, 0, 2, 1, 1, 0, 0, 0, 0, 0, 1]);
+            assert_eq!(budget.cast::<[u32; 8]>().read(), [1 << 27, 3, 5, 4, 2, 0, 0, 1]);
         }
     }
 
