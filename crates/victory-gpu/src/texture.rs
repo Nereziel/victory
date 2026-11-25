@@ -720,11 +720,14 @@ impl Staging {
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
-            const HASH_EVERY: u64 = 8;
+            // Neptune: make the periodic fallback hash configurable. Keep
+            // the original cadence by default; movie planes and recent
+            // unobserved writes still bypass this shortcut below.
+            let hash_every = texture_hash_every();
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(hash_every);
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
@@ -1291,6 +1294,24 @@ fn upload_memory(total: u64) -> Option<(ID3D12Resource, *mut u8, u64, Option<Pie
     Some((b.buffer.clone(), b.data as *mut u8, offset, Some(Piece { block, offset, len })))
 }
 
+/// The periodic hash catches writes which did not go through the guard.
+fn texture_hash_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| hash_interval(std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().as_deref()))
+}
+
+fn hash_interval(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8).clamp(1, 120)
+}
+
+/// Only a single 2D slice whose layout ends behind the smaller mips can
+/// use a truncated staging buffer. Do not apply a partial chain to arrays
+/// or volumes: the subresource sequence would no longer match the data.
+fn staged_part(layout: &victory_formats::texture::Layout, mips: u32, first: u32) -> (u32, usize) {
+    let first = if first < mips && layout.bytes_from(first) < layout.size { first } else { 0 };
+    (first, layout.bytes_from(first) as usize)
+}
+
 /// The staging state of a title texture from mip `first` on, made on first
 /// use (and made anew for larger mips than the one there holds).
 fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
@@ -1317,13 +1338,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    // Only where the title's layout can end behind the smaller mips.
-    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first) < layout.size {
-        first
-    } else {
-        0
-    };
-    let size = layout.bytes_from(first) as usize;
+    let (first, size) = staged_part(&layout, u32::from(d.MipLevels), first);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -1344,6 +1359,12 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             None,
             Some(&mut total),
         );
+    }
+    // GetCopyableFootprints reports UINT64_MAX for an invalid resource
+    // description. Never pass that sentinel to the staging allocator.
+    if total == 0 || total == u64::MAX || count == 0 || rows.contains(&0) {
+        once!(?desc, total, count, "invalid texture upload footprints");
+        return None;
     }
     let making = std::time::Instant::now();
     let (buffer, data, base, piece) = upload_memory(total)?;
@@ -1384,6 +1405,40 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod mip_staging_tests {
+    use super::{hash_interval, staged_part};
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    fn layout(depth_or_array: u32) -> victory_formats::texture::Layout {
+        Texture::new(&TextureDesc {
+            dimension: Dimension::Tex2d, width: 1024, height: 1024,
+            depth_or_array, mips: 9, format: 71, samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        }).unwrap().planes[0].layout.clone()
+    }
+
+    #[test]
+    fn partial_mips_are_staged_only_for_supported_layouts() {
+        let l = layout(1);
+        assert_eq!(staged_part(&l, 9, 4), (4, l.bytes_from(4) as usize));
+        assert!(l.bytes_from(4) < l.size);
+        assert_eq!(staged_part(&l, 9, 0), (0, l.size as usize));
+        assert_eq!(staged_part(&l, 9, 9), (0, l.size as usize));
+        let array = layout(2);
+        assert_eq!(staged_part(&array, 9, 4), (0, array.size as usize));
+    }
+
+    #[test]
+    fn texture_hash_cadence_is_bounded_and_defaults_to_eight() {
+        assert_eq!(hash_interval(None), 8);
+        assert_eq!(hash_interval(Some("invalid")), 8);
+        assert_eq!(hash_interval(Some("0")), 1);
+        assert_eq!(hash_interval(Some(" 16 ")), 16);
+        assert_eq!(hash_interval(Some("1000")), 120);
+    }
 }
 
 #[cfg(test)]
