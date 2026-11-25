@@ -1763,6 +1763,20 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // The same selector used when making an SRV: refresh the aligned
+    // copy that the descriptor actually points to, not its parent buffer.
+    if aligned_views_enabled()
+        && let Some((base, width)) = buffer_extent(view)
+        && let Some(words) = match view {
+            View::Shader(_, Some(words)) => Some(words),
+            View::Placed(false, resource, words) if resource[0] == 1 => words[..10].try_into().ok(),
+            _ => None,
+        }
+        && let Some(parent) = crate::shadow::find(base, width)
+        && let Some(copy) = aligned_srv_copy(base, width, &srv_desc(words), &parent)
+    {
+        return Some((copy, address, len));
+    }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
@@ -1815,6 +1829,16 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, 
     (start % 16 == 0 && bytes % 4 == 0)
         .then(|| u32::try_from(bytes / 4).ok().map(|dwords| (start / 4, dwords)))
         .flatten()
+}
+
+#[cfg(test)]
+#[test]
+fn aligned_srv_range_preserves_first_element_and_rejects_out_of_bounds() {
+    assert_eq!(aligned_srv_range(0x1000, 4096, 100, 1, 4, 456), Some((0x1000 + 456, 1824)));
+    assert_eq!(aligned_srv_range(0x1000, 4096, 0, 0, 4, 456), None);
+    assert_eq!(aligned_srv_range(0x1000, 1000, 100, 1, 4, 456), None);
+    assert_eq!(aligned_srv_range(0x1000, 4096, 100, 0, 4, 455), None);
+    assert_eq!(aligned_srv_range(0x1000, 4096, 100, 0, 0, 456), None);
 }
 
 /// Whether the host accepts a buffer view with these fields of a buffer of
@@ -1897,14 +1921,58 @@ fn left_null(why: &'static str, unordered: bool, address: u64, len: u64, element
     }
 }
 
+fn aligned_views_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIGNED_VIEWS").is_some_and(|v| v == "1"))
+}
+
+/// A structured SRV that cannot be represented as raw bytes at its
+/// parent's offset can be read as raw bytes from its own aligned copy.
+/// Restrict this to SRVs: separate UAV copies would need stronger alias
+/// and write-back guarantees, especially within a single submission.
+fn aligned_srv_range(base: u64, width: u64, offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u64)> {
+    if count == 0 || stride == 0 || stride > 2048 || !stride.is_multiple_of(4)
+        || raw_window(offset, first, count, stride).is_some()
+    {
+        return None;
+    }
+    let from = first.checked_mul(u64::from(stride))?;
+    let len = u64::from(count) * u64::from(stride);
+    if from.checked_add(len)? > width {
+        return None;
+    }
+    Some((base.checked_add(from)?, len))
+}
+
+fn aligned_srv_copy(
+    base: u64,
+    width: u64,
+    desc: &D3D12_SHADER_RESOURCE_VIEW_DESC,
+    parent: &crate::shadow::Shadow,
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if !aligned_views_enabled() || desc.Format != DXGI_FORMAT_UNKNOWN || desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension is BUFFER.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let (start, len) = aligned_srv_range(base, width, parent.offset(base), b.FirstElement, b.NumElements, b.StructureByteStride)?;
+    crate::shadow::aligned_view(start, len)
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
+    let mut shadow = crate::shadow::find(address, len)?;
+    let mut offset = shadow.offset(address);
+    if let Some(copy) = aligned_srv_copy(address, len, &desc, &shadow) {
+        // SAFETY: aligned_srv_copy only accepts BUFFER descriptions.
+        unsafe { desc.Anonymous.Buffer.FirstElement = 0 };
+        shadow = copy;
+        offset = 0;
+    }
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
