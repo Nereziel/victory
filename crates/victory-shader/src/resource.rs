@@ -808,7 +808,7 @@ impl<'a> Tracer<'a> {
         let Fields::Valu(f) = &inst.fields else {
             return None;
         };
-        if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+        if f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0 || f.sdwa.is_some() || f.dpp.is_some() {
             return None;
         }
         match *f.src.first()? {
@@ -839,6 +839,8 @@ impl<'a> Tracer<'a> {
             })) != Some(v)
             || f.abs != 0
             || f.neg != 0
+            || f.clamp
+            || f.omod != 0
             || f.sdwa.is_some()
             || f.dpp.is_some()
         {
@@ -865,6 +867,8 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.vterm(inst, s))
@@ -1583,6 +1587,8 @@ impl<'a> Tracer<'a> {
             && let Fields::Valu(f) = &inst.fields
             && f.abs == 0
             && f.neg == 0
+            && !f.clamp
+            && f.omod == 0
             && f.sdwa.is_none()
             && f.dpp.is_none()
             && let Some(t) = f.src.first().and_then(|s| self.raw(inst, s))
@@ -1996,7 +2002,7 @@ impl<'a> Tracer<'a> {
                 "u64" | "i64" => 2,
                 _ => continue,
             };
-            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            if f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0 || f.sdwa.is_some() || f.dpp.is_some() {
                 continue;
             }
             // The first lane's dwords on one side, the lane's own on the
@@ -2195,7 +2201,7 @@ impl<'a> Tracer<'a> {
                 "v_cndmask_b32" => 2,
                 _ => continue,
             };
-            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            if f.abs != 0 || f.neg != 0 || f.clamp || f.omod != 0 || f.sdwa.is_some() || f.dpp.is_some() {
                 continue;
             }
             for op in f.src.iter().take(sources) {
@@ -2390,6 +2396,27 @@ pub(crate) mod tests {
     use crate::native::RootType::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn modified_vector_moves_are_not_address_copies() {
+        // Exercise the tracer with decoded VALU modifiers rather than
+        // relying on an assembler accepting every modifier on this opcode.
+        for (clamp, omod) in [(false, 0), (true, 0), (false, 1), (false, 2), (false, 3)] {
+            let code: Vec<u8> = [0x7E02_0281u32, S_ENDPGM]
+                .iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut p = crate::ir::build(&code, false, 256).unwrap();
+            let inst = &mut p.blocks[0].insts[0];
+            assert_eq!(inst.name(), "v_mov_b32");
+            let value = inst.write(Reg::V(1)).unwrap();
+            let Fields::Valu(f) = &mut inst.fields else { panic!("VALU move") };
+            f.clamp = clamp;
+            f.omod = omod;
+            let tracer = Tracer::new(&p, &[], HwStage::Cs, None).unwrap();
+            let expected = if clamp || omod != 0 { Term::Value(value) } else { Term::Const(1) };
+            assert_eq!(tracer.vorigin(value), expected);
+            assert_eq!(tracer.vstep(value), expected);
+        }
+    }
 
     #[test]
     fn constant_descriptor_bit_masks() {
