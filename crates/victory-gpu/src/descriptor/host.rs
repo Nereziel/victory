@@ -2430,7 +2430,9 @@ fn keep_views() -> bool {
 fn same_placed_texture(a: &View, b: &View) -> bool {
     match (a, b) {
         (View::Placed(false, resource, desc), View::Placed(false, other, other_desc)) => {
-            resource[0] != 1 && resource == other && desc[10..12] == other_desc[10..12]
+            resource[0] != 1
+                && crate::resource::placed_texture_key(resource) == crate::resource::placed_texture_key(other)
+                && desc[10..12] == other_desc[10..12]
         }
         _ => false,
     }
