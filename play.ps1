@@ -17,6 +17,8 @@ param(
     [switch]$DescriptorData,     # experimental: translate size-only buffer descriptors
     [ValidateRange(1,120)]
     [int]$TextureHashEvery = 8,  # guarded texture fallback hash cadence in frames
+    [ValidateRange(0,512)]
+    [int]$MeshPrewarm = 0,       # speculative mesh pipeline budget per run
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -53,6 +55,8 @@ if ($HeapSync) { Write-Host 'HeapSync: experimental raw descriptor synchronizati
 $env:VICTORY_ALIGNED_VIEWS = if ($AlignedViews) { '1' } else { '0' }
 if ($AlignedViews) { Write-Host 'AlignedViews: experimental structured SRV copies.' }
 $env:VICTORY_TEXTURE_HASH_EVERY = [string]$TextureHashEvery
+$env:VICTORY_MESH_PREWARM = [string]$MeshPrewarm
+if ($MeshPrewarm -gt 0) { Write-Host "MeshPrewarm: up to $MeshPrewarm speculative pipelines." }
 $env:VICTORY_DESC_DATA = if ($DescriptorData) { '1' } else { '0' }
 if ($DescriptorData) { Write-Host 'DescriptorData: experimental size-only buffer translation.' }
 $env:VICTORY_LATE_WAIT           = '3'
@@ -151,13 +155,14 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } else { "TextureHash$TextureHashEvery" }
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } else { "MeshPrewarm$MeshPrewarm" }
     if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
     if ($AlignedViews -and $mode -ne 'AlignedViews') { $mode += '+AlignedViews' }
     if ($DescriptorData -and $mode -ne 'DescriptorData') { $mode += '+DescriptorData' }
     if ($TextureHashEvery -ne 8 -and $mode -ne "TextureHash$TextureHashEvery") { $mode += "+TextureHash$TextureHashEvery" }
+    if ($MeshPrewarm -gt 0 -and $mode -ne "MeshPrewarm$MeshPrewarm") { $mode += "+MeshPrewarm$MeshPrewarm" }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
