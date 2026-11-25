@@ -321,21 +321,49 @@ pub(crate) fn take_dropped() -> u64 {
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 
-/// Takes `more` from the time a run may spend bringing in a long queue of
-/// textures at more than the usual pace; whether some is left.
-/// `VICTORY_TEXTURE_GATE_S` sets it (0: none).
-fn catching_up(more: std::time::Duration) -> bool {
-    static SPENT: AtomicU64 = AtomicU64::new(0);
+/// Per-backlog allowance for accelerated texture uploads. A new scene gets
+/// a fresh allowance after the previous backlog has settled.
+/// Adapted from skornuta/victory-fork c858d28 (Proudnoob4).
+struct CatchupGate {
+    spent_ms: AtomicU64,
+}
+
+impl CatchupGate {
+    const fn new() -> Self {
+        Self { spent_ms: AtomicU64::new(0) }
+    }
+
+    fn has_budget(&self, total_ms: u64) -> bool {
+        self.spent_ms.load(Ordering::Relaxed) < total_ms
+    }
+
+    fn charge(&self, more: std::time::Duration) {
+        let ms = more.as_millis().min(u64::MAX as u128) as u64;
+        if ms != 0 {
+            let _ = self.spent_ms.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |spent| {
+                Some(spent.saturating_add(ms))
+            });
+        }
+    }
+
+    fn reset_if_settled(&self, due: u64, settled: u64) {
+        if due <= settled {
+            self.spent_ms.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+static CATCHUP_GATE: CatchupGate = CatchupGate::new();
+
+fn texture_gate_ms() -> u64 {
     static TOTAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let total = *TOTAL.get_or_init(|| {
-        let seconds = std::env::var("VICTORY_TEXTURE_GATE_S")
+    *TOTAL.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_GATE_S")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(60);
-        seconds * 1000
-    });
-    let more = more.as_millis() as u64;
-    SPENT.fetch_add(more, Ordering::Relaxed) + more < total
+            .unwrap_or(60)
+            .saturating_mul(1000)
+    })
 }
 
 /// Buffer views of the heap whose slot showed another host buffer than
@@ -1514,10 +1542,11 @@ impl State {
         /// Bytes of texture memory staged per frame, and while the queue is
         /// long (the world's first minutes: over 20,000 slots, which at the
         /// usual pace took three and a half minutes with the materials
-        /// black) as much more as `CATCH_UP` in all allows.
+        /// black) as much more as the per-backlog catch-up gate allows.
         const PER_FRAME: u64 = 192 << 20;
         const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
         const LONG: u64 = 2_000;
+        const SETTLED: u64 = 500;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1575,7 +1604,9 @@ impl State {
         // The rest waits for the next frames, as it does past the bytes.
         const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
         const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
-        let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
+        CATCHUP_GATE.reset_if_settled(census[0], SETTLED);
+        let catching = census[0] > LONG && CATCHUP_GATE.has_budget(texture_gate_ms());
+        let (per_frame, span) = if catching {
             (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
         } else {
             (PER_FRAME, SPAN)
@@ -1589,6 +1620,7 @@ impl State {
         });
         let per_frame = mb.map_or(per_frame, |v| v.clamp(16, 1024) << 20);
         let span = ms.map_or(span, |v| std::time::Duration::from_millis(v.clamp(10, 1500)));
+        let plain_span = ms.map_or(SPAN, |v| std::time::Duration::from_millis(v.clamp(10, 1500)));
         let began = std::time::Instant::now();
         let mut looked = 0u64;
         for (index, write) in due {
@@ -1737,7 +1769,9 @@ impl State {
         }
         HEAP_TEXTURE_PHASES[5].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_TEXTURE_PHASES[6].fetch_add(looked, Ordering::Relaxed);
-        catching_up(began.elapsed().saturating_sub(SPAN));
+        if catching {
+            CATCHUP_GATE.charge(began.elapsed().saturating_sub(plain_span));
+        }
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -2902,4 +2936,41 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod catchup_tests {
+    use super::CatchupGate;
+    use std::time::Duration;
+
+    #[test]
+    fn fresh_budget_after_backlog_settles() {
+        let gate = CatchupGate::new();
+        assert!(gate.has_budget(60_000));
+        gate.charge(Duration::from_secs(35));
+        assert!(gate.has_budget(60_000));
+        gate.charge(Duration::from_secs(25));
+        assert!(!gate.has_budget(60_000));
+
+        gate.reset_if_settled(501, 500);
+        assert!(!gate.has_budget(60_000));
+        gate.reset_if_settled(500, 500);
+        assert!(gate.has_budget(60_000));
+    }
+
+    #[test]
+    fn zero_budget_stays_disabled() {
+        let gate = CatchupGate::new();
+        assert!(!gate.has_budget(0));
+        gate.reset_if_settled(0, 500);
+        assert!(!gate.has_budget(0));
+    }
+
+    #[test]
+    fn charge_saturates_instead_of_wrapping() {
+        let gate = CatchupGate::new();
+        gate.charge(Duration::from_millis(u64::MAX));
+        gate.charge(Duration::from_millis(1));
+        assert!(!gate.has_budget(u64::MAX));
+    }
 }
