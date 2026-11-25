@@ -4155,7 +4155,18 @@ impl Host {
                 self.card_sent();
                 self.queue.Signal(&fence, sent)?;
                 fence.SetEventOnCompletion(sent, event)?;
-                WaitForSingleObject(event, INFINITE);
+                let waited = WaitForSingleObject(event, INFINITE);
+                // Vertex 25308e6: device removal signals fence events
+                // without completing their copies. Never merge stale
+                // readback bytes into the title's memory.
+                let completed = fence.GetCompletedValue();
+                if completed == u64::MAX {
+                    self.device.GetDeviceRemovedReason()?;
+                    return Err(DXGI_ERROR_DEVICE_REMOVED.into());
+                }
+                if waited != windows::Win32::Foundation::WAIT_OBJECT_0 || completed < sent {
+                    return Err(windows::Win32::Foundation::E_FAIL.into());
+                }
                 Ok(after)
             })()
         };
