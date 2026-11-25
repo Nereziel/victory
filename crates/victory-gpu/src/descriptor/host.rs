@@ -2879,6 +2879,121 @@ mod tests {
     }
 
 
+    /// GPU regression for the unsigned 16-bit view path (adapted from
+    /// Vertex 3562acb / fxceless PR #927). Every possible half bit pattern,
+    /// including NaNs and integer indices, must survive without conversion.
+    /// This tests the host operation, not the shader translator's lowering.
+    #[test]
+    fn halves_cross_an_unsigned_buffer_view_unchanged() {
+        let Some(host) = host() else {
+            eprintln!("half-view GPU regression skipped: no host device");
+            return;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT_R16G16B16A16_UINT,
+            ..Default::default()
+        };
+        // SAFETY: the query writes only the supplied structure.
+        unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }.expect("format support query");
+        let required = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0
+            | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+        if support.Support2.0 & required != required {
+            eprintln!("half-view GPU regression skipped: typed UAV load/store unsupported");
+            return;
+        }
+        const SHADER: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2))"
+RWBuffer<uint4> src : register(u0);
+RWBuffer<uint4> dst : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint4 h = src[id.x] & 0xffff;
+    uint low = h.x | (h.y << 16);
+    uint high = h.z | (h.w << 16);
+    dst[id.x] = uint4(low & 0xffff, low >> 16, high & 0xffff, high >> 16);
+}
+"#;
+        const ELEMENTS: usize = 1 << 14;
+        const BYTES: u64 = ELEMENTS as u64 * 8;
+        let code = crate::host::compile(
+            SHADER, windows::core::s!("main"), windows::core::s!("cs_5_1"),
+        ).expect("half-view regression shader");
+        let (from, filled) = host.shared_buffer(BYTES).expect("source buffer");
+        let (to, result) = host.shared_buffer(BYTES).expect("destination buffer");
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 2,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        };
+        // SAFETY: buffers and heap remain live through the synchronous
+        // submission; the mapped ranges hold exactly BYTES bytes.
+        unsafe {
+            let heap: ID3D12DescriptorHeap =
+                host.device.CreateDescriptorHeap(&desc).expect("test view heap");
+            let root: ID3D12RootSignature =
+                host.device.CreateRootSignature(0, &code).expect("test root signature");
+            let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                }
+            ).expect("test compute pipeline");
+            for (i, half) in std::slice::from_raw_parts_mut(filled.cast::<u16>(), ELEMENTS * 4)
+                .iter_mut().enumerate()
+            {
+                *half = i as u16;
+            }
+            std::ptr::write_bytes(result, 0xee, BYTES as usize);
+            // Use the production mapping rather than hard-coding the twin.
+            let format = half_format(10).expect("unsigned twin of RGBA16_FLOAT");
+            let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT(format as i32),
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: ELEMENTS as u32,
+                        ..Default::default()
+                    },
+                },
+            };
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let step = host.device.GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            ) as usize;
+            host.device.CreateUnorderedAccessView(&from, None::<&ID3D12Resource>, Some(&view), start);
+            host.device.CreateUnorderedAccessView(
+                &to, None::<&ID3D12Resource>, Some(&view),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + step },
+            );
+            let list = host.new_list().expect("test command list");
+            list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetPipelineState(&pso);
+            list.list.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            list.list.Dispatch(ELEMENTS as u32 / 64, 1, 1);
+            list.close();
+            host.execute(&[&list]);
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+            for (i, &half) in std::slice::from_raw_parts(result.cast::<u16>(), ELEMENTS * 4)
+                .iter().enumerate()
+            {
+                assert_eq!(half, i as u16, "bit pattern {i:#06x}");
+            }
+        }
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
