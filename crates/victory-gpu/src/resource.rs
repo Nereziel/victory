@@ -1458,6 +1458,57 @@ pub(crate) fn room() -> bool {
     }
 }
 
+/// Optional pressure eviction, adapted from Neptune. Only shorten the
+/// normal idle interval for a bounded set of otherwise safe victims.
+#[cfg(windows)]
+const PRESSED_MS: u64 = 3_000;
+#[cfg(windows)]
+const PRESSED_FRAMES: u64 = 8;
+
+#[cfg(windows)]
+fn pressure_need() -> u64 {
+    static PERCENT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(percent) = *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_EVICT").ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| (50..=97).contains(&v))
+    }) else { return 0 };
+    let Some([budget, used, ..]) = crate::host::host().and_then(|h| h.video_memory()) else {
+        return 0;
+    };
+    if budget == 0 { return 0; }
+    // Count reusable ranges as room, as the texture admission policy does.
+    let used = used.saturating_sub(HEAP_FREE.load(std::sync::atomic::Ordering::Relaxed));
+    used.saturating_sub(texture_room_line(budget, percent)).min(256 << 20)
+}
+
+#[cfg(any(windows, test))]
+fn pressure_oldest(mut copies: Vec<(usize, u64, u64)>, need: u64) -> Vec<usize> {
+    // Stable tie-breaking by address. At most one texture may overshoot
+    // the byte target, since a texture cannot be released partially.
+    copies.sort_unstable_by_key(|&(at, stamp, _)| (stamp, at));
+    let mut remaining = need;
+    let mut chosen = Vec::new();
+    for (at, _, bytes) in copies {
+        if remaining == 0 { break; }
+        if bytes == 0 { continue; }
+        chosen.push(at);
+        remaining = remaining.saturating_sub(bytes);
+    }
+    chosen.sort_unstable();
+    chosen
+}
+
+#[cfg(test)]
+#[test]
+fn pressure_selects_oldest_whole_textures_until_target() {
+    let copies = vec![(4, 20, 100), (3, 10, 70), (2, 10, 50), (1, 5, 0)];
+    assert!(pressure_oldest(copies.clone(), 0).is_empty());
+    assert_eq!(pressure_oldest(copies.clone(), 50), vec![2]);
+    assert_eq!(pressure_oldest(copies.clone(), 51), vec![2, 3]);
+    assert_eq!(pressure_oldest(copies, 1000), vec![2, 3, 4]);
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -1500,7 +1551,33 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    let need = pressure_need();
     let all = textures();
+    // Keep the texture registry locked through selection and eviction,
+    // so a destroyed title object cannot be replaced at the same address.
+    let pressed = if need != 0 {
+        let mut candidates = Vec::new();
+        for &at in all.iter() {
+            // SAFETY: the registry lock keeps the title resource alive.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) || crate::texture::host_wrote(at) { continue; }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((host, twin)) = made.as_ref() else { continue };
+            let stamp = r.host.used.load(Relaxed);
+            if twin.is_none() && host.filled
+                && crate::host::long_ago(stamp, PRESSED_MS, PRESSED_FRAMES)
+                && !crate::host::long_ago(stamp, idle_ms, IDLE_FRAMES)
+                && std::sync::Arc::strong_count(host) == 1
+                && crate::host::references(&host.texture) == 1
+            {
+                candidates.push((at, stamp, host.bytes));
+            }
+        }
+        pressure_oldest(candidates, need)
+    } else {
+        Vec::new()
+    };
+    let (mut pressure_count, mut pressure_bytes) = (0u64, 0u64);
     for &at in all.iter() {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
@@ -1510,10 +1587,17 @@ pub(crate) fn let_go_idle() {
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
-            let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+            let idle = made.as_ref().is_some_and(|(host, twin)| {
+                let stamp = r.host.used.load(Relaxed);
+                let normal = crate::host::long_ago(stamp, idle_ms, IDLE_FRAMES);
+                let early = pressed.binary_search(&at).is_ok()
+                    && twin.is_none() && host.filled
+                    && pressure_bytes < need
+                    && crate::host::long_ago(stamp, PRESSED_MS, PRESSED_FRAMES);
+                (normal || early)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
+                    && !crate::texture::host_wrote(at)
             });
             if idle {
                 // Under the lock: the next use must not find the staging
@@ -1528,6 +1612,10 @@ pub(crate) fn let_go_idle() {
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
+            if pressed.binary_search(&at).is_ok() {
+                pressure_count += 1;
+                pressure_bytes = pressure_bytes.saturating_add(host.bytes);
+            }
             went += 1;
             bytes += host.bytes;
             if first.is_none() {
@@ -1535,6 +1623,11 @@ pub(crate) fn let_go_idle() {
             }
             crate::host::retire(host);
         }
+    }
+    drop(all);
+    if pressure_count != 0 {
+        tracing::info!(textures = pressure_count, selected_mb = pressure_bytes >> 20,
+            requested_mb = need >> 20, "VRAM pressure: idle textures retired");
     }
     if went > 0 {
         crate::host::trail(|| {
