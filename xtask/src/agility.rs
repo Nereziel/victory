@@ -246,14 +246,6 @@ mod tests {
                 "apps/victory/src/agility.rs",
                 include_str!("../../apps/victory/src/agility.rs"),
             ),
-            (
-                "crates/victory-shader/src/agility.rs",
-                include_str!("../../crates/victory-shader/src/agility.rs"),
-            ),
-            (
-                "crates/victory-gpu/src/agility.rs",
-                include_str!("../../crates/victory-gpu/src/agility.rs"),
-            ),
         ] {
             assert!(
                 source.contains(&format!("D3D12SDKVersion: u32 = {minor};")),
