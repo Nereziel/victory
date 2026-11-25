@@ -5229,6 +5229,25 @@ impl<'a> Lower<'a> {
                 };
                 (self.s.m.bin(c, op, a, b), None)
             }
+            // Pack the selected 16-bit halves of two scalar dwords.
+            // Adapted from fxceless/victory-fork#799; no wave approximation.
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xffff));
+                let a = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    a
+                };
+                let a = self.s.m.bin(c, Bin::And, a, low);
+                let b = if name == "s_pack_ll_b32_b16" {
+                    self.s.m.bin(c, Bin::Shl, b, k16)
+                } else {
+                    let high = self.s.m.i32(0xffff_0000);
+                    self.s.m.bin(c, Bin::And, b, high)
+                };
+                (self.s.m.bin(c, Bin::Or, a, b), None)
+            }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
@@ -11259,6 +11278,22 @@ mod tests {
             // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
+        }
+    }
+
+    #[test]
+    fn scalar_pack_halves_lower() {
+        for opcode in [0x32u32, 0x33, 0x34] {
+            let words = [
+                0xBE80_03FF, 0x1234_5678, // s_mov_b32 s0, literal
+                0xBE81_03FF, 0x9abc_def0, // s_mov_b32 s1, literal
+                0x8002_0100 | (opcode << 23), // s_pack_* s2, s0, s1
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // use the packed value in a branch
+                0xBE84_0380,
+                S_ENDPGM,
+            ];
+            lowers(&words, 0).unwrap();
         }
     }
 
