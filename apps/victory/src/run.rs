@@ -128,10 +128,9 @@ pub fn run(
     if std::env::var_os("VICTORY_HOST_EARLY").is_none_or(|v| v != "0") {
         let started = std::time::Instant::now();
         let adapter = victory_hle::modules::d3d12x::host_adapter();
-        tracing::info!(
-            ms = started.elapsed().as_millis() as u64,
-            adapter = ?adapter,
-            "host D3D12 initialization before title startup"
+        eprintln!(
+            "host D3D12 initialization before title startup: {} ms, adapter={adapter:?}",
+            started.elapsed().as_millis()
         );
     }
     // SAFETY: imports are bound; from here on we run title code.
