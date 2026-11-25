@@ -678,7 +678,7 @@ pub(crate) extern "system" fn create_stream(
     #[cfg(windows)]
     let mut recorded = manifest::Recorded::default();
     let mut at = 0;
-    while at + 8 <= desc.size {
+    while desc.size - at >= 8 {
         // SAFETY: inside the stream the title passes.
         let kind = unsafe { desc.stream.add(at).cast::<u32>().read_unaligned() };
         let Some((size, stage)) = subobject(kind) else {
@@ -689,18 +689,22 @@ pub(crate) extern "system" fn create_stream(
             );
             break;
         };
+        if size > desc.size - at {
+            tracing::warn!(kind, at, size, remaining = desc.size - at,
+                "truncated pipeline subobject");
+            return E_INVALIDARG;
+        }
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // VIctory 6fcbbe9: the title's stream need not be 8-aligned.
+            // SAFETY: the complete shader subobject was checked above.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
         unsafe {
             graphics.read(kind, desc.stream.add(at));
-            if at + size <= desc.size {
-                recorded.subobject(kind, std::slice::from_raw_parts(desc.stream.add(at), size));
-            }
+            recorded.subobject(kind, std::slice::from_raw_parts(desc.stream.add(at), size));
         };
         at += size;
     }
@@ -841,6 +845,27 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[test]
+    fn unaligned_streams_are_read_and_truncated_subobjects_rejected() {
+        let shader = [7u8, 8, 9];
+        let mut backing = [0u64; 4];
+        // SAFETY: the 32-byte backing is live and 8-aligned.
+        let stream = unsafe {
+            std::slice::from_raw_parts_mut(backing.as_mut_ptr().cast::<u8>().add(1), 24)
+        };
+        stream[..4].copy_from_slice(&1u32.to_le_bytes());
+        stream[8..16].copy_from_slice(&(shader.as_ptr() as u64).to_le_bytes());
+        stream[16..24].copy_from_slice(&(shader.len() as u64).to_le_bytes());
+        let mut p = std::ptr::null();
+        let desc = StreamDesc { size: 16, stream: stream.as_ptr() };
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), E_INVALIDARG);
+        assert!(p.is_null());
+        let desc = StreamDesc { size: 24, ..desc };
+        assert_eq!(create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p), S_OK);
+        assert_eq!(shaders(p), [("vertex", shader.to_vec())]);
+        slot::<extern "system" fn(This) -> u32>(p, 0x10)(p);
     }
 
     /// The stream layout the title builds (title+0x86f090): root
