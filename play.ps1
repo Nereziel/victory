@@ -8,6 +8,9 @@ param(
     [string]$Game = '',
     [switch]$Release,            # use target\release instead of target\diag
     [switch]$Perf,               # use target\perf (ThinLTO performance build)
+    [switch]$FSR,                # optional PC FidelityFX SDK upscaler
+    [switch]$NoFSR,              # restore original linear upscale
+    [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
     [switch]$Warm,               # redo the shader warm-up even if this build already did it
@@ -80,6 +83,23 @@ if ($Benchmark) {
     Write-Host "Benchmark mode: $Benchmark"
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
+
+# FSR is independent of the benchmark profile.
+if ($NoFSR -and ($FSR -or $FsrDir)) { throw 'Choose -FSR or -NoFSR.' }
+if ($NoFSR) {
+    Remove-Item Env:VICTORY_FFX_DIR -ErrorAction SilentlyContinue
+} elseif ($FSR -or $FsrDir) {
+    if (-not $FsrDir) { $FsrDir = $env:VICTORY_FFX_DIR }
+    if (-not $FsrDir) { $FsrDir = 'C:\FidelityFX-SDK\Kits\FidelityFX\signedbin' }
+    foreach ($dll in @('amd_fidelityfx_loader_dx12.dll','amd_fidelityfx_upscaler_dx12.dll')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $FsrDir $dll) -PathType Leaf)) {
+            throw "Missing SDK library $dll in $FsrDir. Extract the official FidelityFX SDK 2.4.0 or use -NoFSR."
+        }
+    }
+    $env:VICTORY_FFX_DIR = (Resolve-Path -LiteralPath $FsrDir).ProviderPath
+    Write-Host "Experimental FSR: $env:VICTORY_FFX_DIR"
+}
+
 
 # Shader warm-up: without it every shader is translated and compiled while the game runs, behind a
 # black screen (the loading screen included). Run once per build of victory.exe: on the first run
