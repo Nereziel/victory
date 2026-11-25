@@ -1968,8 +1968,8 @@ fn buffer_srv(
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
     if let Some(copy) = aligned_srv_copy(address, len, &desc, &shadow) {
-        // SAFETY: aligned_srv_copy only accepts BUFFER descriptions.
-        unsafe { desc.Anonymous.Buffer.FirstElement = 0 };
+        // aligned_srv_copy only accepts BUFFER descriptions.
+        desc.Anonymous.Buffer.FirstElement = 0;
         shadow = copy;
         offset = 0;
     }
