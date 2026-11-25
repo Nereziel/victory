@@ -572,12 +572,28 @@ pub(crate) fn pipeline(
     Ok(pso)
 }
 
+/// Keep the entire disk publication ordered, not just D3D12 serialization.
+/// A periodic save can skip a busy publisher; an explicit save waits.
+/// This lock is never acquired by loads or stores.
+fn publishing(lock: &Mutex<()>, now: bool) -> Option<MutexGuard<'_, ()>> {
+    if now {
+        return Some(lock.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 /// Writes the library and the early list if pipelines were added since the
 /// last save and `SAVE_EVERY` has passed (or `now`).
 pub(crate) fn save(now: bool) {
+    static PUBLISHING: Mutex<()> = Mutex::new(());
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(_publication) = publishing(&PUBLISHING, now) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
@@ -594,16 +610,17 @@ pub(crate) fn save(now: bool) {
     // added: the library on disk is then what it was, and only the early
     // list is written (a title pipeline first drawn with wrote all 1,352 MB
     // of the library again: run 60's second save).
-    let bytes = {
+    let (bytes, serialized_added) = {
         let _all = one_call();
         // No store between asking the size and writing; loads go on.
         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
         let added = library.added.load(Ordering::Relaxed);
-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+        let early_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
+        if !early_changed && added == 0 {
             return;
         }
         if added == 0 {
-            0
+            (0, 0)
         } else {
             // SAFETY: a plain query.
             let size = unsafe { library.library.GetSerializedSize() };
@@ -611,19 +628,27 @@ pub(crate) fn save(now: bool) {
             if let Err(e) = serialise(&library.library, &tmp, size) {
                 tracing::warn!(error = %e, "host pipeline library not serialised");
                 let _ = std::fs::remove_file(&tmp);
+                if early_changed {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                }
                 return;
             }
             library.added.store(0, Ordering::Relaxed);
-            SAVED.store(size as u64, Ordering::Relaxed);
-            size
+            (size, added)
         }
     };
     // With what earlier runs listed: a run that asks for no title pipeline
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
     let used: Vec<String> = used().iter().flatten().cloned().collect();
-    let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
-    if bytes > 0 && library_written.is_ok() {
+    let library_written = if serialized_added > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+    if library_written.is_err() {
+        // Stores since serialization may already have incremented added.
+        // Restore the unsaved count without losing those additions.
+        library.added.fetch_add(serialized_added, Ordering::Relaxed);
+    }
+    if serialized_added > 0 && library_written.is_ok() {
+        SAVED.store(bytes as u64, Ordering::Relaxed);
         // In place unless the system refused and the new one waits beside it.
         let in_place = !dir.join(NEXT_FILE).exists();
         if in_place && VIEW[0].load(Ordering::Relaxed) != 0 {
@@ -648,7 +673,11 @@ pub(crate) fn save(now: bool) {
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipeline library saved"
         ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+        Err(e) => {
+            // A failed publication must be retried even without new draws.
+            USED_CHANGED.store(true, Ordering::Relaxed);
+            tracing::warn!(error = %e, "host pipeline library not saved");
+        }
     }
 }
 
@@ -678,7 +707,14 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// stay: the rest read as zeros). Where a system refuses, the new library
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+    let next = dir.join(NEXT_FILE);
+    // Once a newer library is pending, replace that pending version.
+    // Otherwise a stale .next could overwrite a later successful save
+    // at the next start (Blob::of promotes it first).
+    if next.exists() {
+        return std::fs::rename(tmp, next);
+    }
+    std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, next))
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -724,6 +760,30 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn periodic_publication_skips_an_active_save() {
+        let lock = Mutex::new(());
+        let guard = publishing(&lock, true).unwrap();
+        assert!(publishing(&lock, false).is_none());
+        drop(guard);
+        assert!(publishing(&lock, false).is_some());
+    }
+
+    #[test]
+    fn newer_save_replaces_pending_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let current = dir.join(LIBRARY_FILE);
+        let pending = dir.join(NEXT_FILE);
+        let tmp = current.with_extension("tmp");
+        std::fs::write(&current, b"original").unwrap();
+        std::fs::write(&pending, b"older pending").unwrap();
+        std::fs::write(&tmp, b"newest").unwrap();
+        replace_library(dir, &tmp).unwrap();
+        assert_eq!(std::fs::read(&pending).unwrap(), b"newest");
+        assert_eq!(Blob::of(dir).bytes(), b"newest");
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
