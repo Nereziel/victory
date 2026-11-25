@@ -218,9 +218,12 @@ extern "system" fn create_queue(
 /// The title asks for 32 MiB and stops if this fails.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
     tracing::info!(size, "dstorage: staging buffer size");
-    if let Some(scheduler) = scheduler() {
-        scheduler.lock().staging = u64::from(size);
-    }
+    let Some(scheduler) = scheduler() else {
+        return E_OUTOFMEMORY;
+    };
+    scheduler.lock().staging = u64::from(size);
+    // Workers waiting on the old limit must reconsider it immediately.
+    scheduler.work.notify_all();
     S_OK
 }
 
@@ -395,7 +398,7 @@ unsafe impl Send for Job {}
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
     static SCHEDULER: OnceLock<Option<Scheduler>> = OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
+    static STARTED: OnceLock<usize> = OnceLock::new();
     let scheduler = SCHEDULER
         .get_or_init(|| {
             Some(Scheduler {
@@ -419,8 +422,9 @@ fn scheduler() -> Option<&'static Scheduler> {
             })
         })
         .as_ref()?;
-    STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let started = *STARTED.get_or_init(|| {
+        let available = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count(available, std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref());
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -429,9 +433,29 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(workers = started, requested = workers, "dstorage: workers");
+        started
     });
-    Some(scheduler)
+    // Without a worker, returning a queue would leave the title polling
+    // forever. Partial worker creation is sufficient to make progress.
+    (started != 0).then_some(scheduler)
+}
+
+fn worker_count(available: usize, setting: Option<&str>) -> usize {
+    setting.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n != 0)
+        .map_or(available.max(1), |n| n.clamp(1, 64))
+}
+
+#[cfg(test)]
+#[test]
+fn storage_worker_override_is_bounded_and_auto_preserves_default() {
+    assert_eq!(worker_count(16, None), 16);
+    assert_eq!(worker_count(16, Some("0")), 16);
+    assert_eq!(worker_count(16, Some("bad")), 16);
+    assert_eq!(worker_count(16, Some(" 4 ")), 4);
+    assert_eq!(worker_count(16, Some("1000")), 64);
+    assert_eq!(worker_count(0, None), 1);
 }
 
 impl Scheduler {
