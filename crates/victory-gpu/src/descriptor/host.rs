@@ -2118,8 +2118,8 @@ fn buffer_uav(
 /// (#2462): a typed UAV in an unsupported format may remove the device.
 /// Structured/raw buffer UAVs are checked separately by buffer_view_ok.
 fn typed_store(format: u32) -> bool {
-    static SUPPORT: Mutex<std::collections::HashMap<u32, bool>> =
-        Mutex::new(std::collections::HashMap::new());
+    static SUPPORT: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, bool>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
     let mut support = SUPPORT.lock().unwrap_or_else(|e| e.into_inner());
     *support.entry(format).or_insert_with(|| {
         let Some(host) = host() else { return false };
