@@ -25,6 +25,8 @@ param(
     [int]$TextureRoomPercent = 90, # DXGI budget share for background textures
     [ValidateRange(0,8192)]
     [int]$TargetReserveMB = 0,  # reserve for render targets not yet allocated
+    [ValidateScript({ $_ -eq 0 -or ($_ -ge 50 -and $_ -le 97) })]
+    [int]$VramEvictPercent = 0, # pressure-based idle texture eviction; 0 disables
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -63,6 +65,8 @@ if ($AlignedViews) { Write-Host 'AlignedViews: experimental structured SRV copie
 $env:VICTORY_TEXTURE_HASH_EVERY = [string]$TextureHashEvery
 $env:VICTORY_TEXTURE_ROOM_PERCENT = [string]$TextureRoomPercent
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = [string]$TargetReserveMB
+$env:VICTORY_VRAM_EVICT = [string]$VramEvictPercent
+if ($VramEvictPercent -gt 0) { Write-Host "VRAM eviction: above $VramEvictPercent percent." }
 if ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0) {
     Write-Host "VRAM policy: $TextureRoomPercent percent, $TargetReserveMB MiB target reserve."
 }
@@ -168,7 +172,7 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
     $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } elseif ($MeshPrewarm -gt 0) { "MeshPrewarm$MeshPrewarm" } elseif ($Ambient -ge 0) { 'Ambient' } else { 'VRAM' }
     if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
@@ -177,7 +181,7 @@ if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $Descriptor
     if ($TextureHashEvery -ne 8 -and $mode -ne "TextureHash$TextureHashEvery") { $mode += "+TextureHash$TextureHashEvery" }
     if ($MeshPrewarm -gt 0 -and $mode -ne "MeshPrewarm$MeshPrewarm") { $mode += "+MeshPrewarm$MeshPrewarm" }
     if ($Ambient -ge 0 -and $mode -ne 'Ambient') { $mode += '+Ambient' }
-    if (($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0) -and $mode -ne 'VRAM') { $mode += '+VRAM' }
+    if (($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) -and $mode -ne 'VRAM') { $mode += '+VRAM' }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
