@@ -1365,13 +1365,50 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Neptune's adjustable texture admission line and render-target reserve.
+/// Default (90%, no reserve) keeps the existing policy, including its
+/// startup floor. A custom policy respects DXGI even below that floor.
+#[cfg(windows)]
+fn texture_room_policy() -> (u64, u64) {
+    static POLICY: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| {
+        let read = |name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let percent = read("VICTORY_TEXTURE_ROOM_PERCENT").unwrap_or(90).clamp(50, 97);
+        let targets = read("VICTORY_CARD_ROOM_FOR_TARGETS_MB").unwrap_or(0).min(8192) << 20;
+        (percent, targets)
+    })
+}
+
+/// Existing targets consume their reserved headroom, so the texture
+/// queue gets it back as the world creates its render targets.
+#[cfg(any(windows, test))]
+fn texture_room_used(used: u64, free: u64, targets: u64, reserve: u64) -> u64 {
+    used.saturating_sub(free).saturating_add(reserve.saturating_sub(targets))
+}
+
+#[cfg(any(windows, test))]
+fn texture_room_line(budget: u64, percent: u64) -> u64 {
+    (budget / 100) * percent + (budget % 100) * percent / 100
+}
+
+#[cfg(test)]
+#[test]
+fn texture_room_reservation_recedes_as_targets_are_created() {
+    assert_eq!(texture_room_used(800, 100, 100, 300), 900);
+    assert_eq!(texture_room_used(900, 100, 200, 300), 900);
+    assert_eq!(texture_room_used(1000, 100, 400, 300), 900);
+    assert_eq!(texture_room_used(10, 20, 0, 0), 0);
+    assert_eq!(texture_room_used(u64::MAX, 0, 0, 1), u64::MAX);
+    assert_eq!(texture_room_line(1023, 90), 920);
+    assert_eq!(texture_room_line(0, 90), 0);
+    assert!(texture_room_line(u64::MAX, 97) < u64::MAX);
+}
+
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to `FLOOR` bytes of them, beyond that while the card's memory in use
-/// by this process is under nine tenths of the budget the system gives it
-/// (`VICTORY_TEXTURE_BUDGET_MB` sets a limit on those copies' bytes
-/// instead). Past the budget the system moves the card's memory into the
-/// PC's, which ended runs 20 and 24.
+/// shaders that pick textures by index (`draw.rs` `heap_textures`).
+/// `VICTORY_TEXTURE_BUDGET_MB` overrides the DXGI admission policy.
+/// The percentage and render-target reserve only govern background
+/// texture creation, not mandatory resources used by actual draws.
 #[cfg(windows)]
 pub(crate) fn room() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1380,23 +1417,44 @@ pub(crate) fn room() -> bool {
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+        mb.trim().parse::<u64>().ok().map(|mb| mb.saturating_mul(1 << 20))
     });
     let filled = KINDS[1].load(Relaxed);
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if filled < FLOOR {
+    let (percent, reserve) = texture_room_policy();
+    let custom = percent != 90 || reserve != 0;
+    if filled < FLOOR && !custom {
         return true;
     }
     // Placed textures nothing holds any more give their ranges back here
     // too: with no room nothing is placed, which is where else it is done.
     sweep_leaving();
     match crate::host::host().and_then(|h| h.video_memory()) {
-        // What is free in the texture heaps is room, though the system
-        // counts it as in use.
-        Some([budget, used, ..]) => used.saturating_sub(HEAP_FREE.load(Relaxed)) < budget / 10 * 9,
-        None => filled < WITHOUT_BUDGET,
+        Some([budget, used, ..]) if budget > 0 => {
+            let free = HEAP_FREE.load(Relaxed);
+            let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(filled);
+            let effective = texture_room_used(used, free, targets, reserve);
+            let line = texture_room_line(budget, percent);
+            let room = effective < line;
+            if !room && custom {
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+                let second = crate::host::now_ms() / 1000;
+                if LAST.swap(second, Relaxed) != second {
+                    tracing::info!(
+                        used_mb = used >> 20, free_heap_mb = free >> 20,
+                        targets_mb = targets >> 20,
+                        reserved_mb = reserve.saturating_sub(targets) >> 20,
+                        effective_mb = effective >> 20, limit_mb = line >> 20,
+                        budget_mb = budget >> 20, percent,
+                        "texture queue paused by VRAM policy"
+                    );
+                }
+            }
+            room
+        }
+        _ => filled < WITHOUT_BUDGET,
     }
 }
 
