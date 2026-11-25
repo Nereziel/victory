@@ -302,12 +302,23 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if start >= end {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    ahead_answer(&j, first, last)
+}
+
+/// A retained kernel asking may be older than explicit writes noted by
+/// the submitter, or later overlapping kernel queries. The copy watermark
+/// must cover every write returned, not just the original asking.
+fn ahead_answer(j: &Journal, first: usize, last: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    if first >= last || !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return None;
+    }
+    let written = j.written.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    Some((j.asked, written))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -319,27 +330,23 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     crate::zone!("write watch");
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    if start >= end {
+        return None;
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let entered = std::time::Instant::now();
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        let answer = Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+    if let Some(answer) = ahead_answer(j, first, last) {
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::JournalAnswers, 1);
             add(C::JournalUs, entered.elapsed().as_micros() as u64);
         }
-        return answer;
+        return Some(answer);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -587,6 +594,9 @@ fn uncommitted_end(block: usize) -> usize {
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    if start >= end {
+        return false;
+    }
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
@@ -608,6 +618,9 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
@@ -722,6 +735,9 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -802,6 +818,39 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn retained_asking_watermark_includes_later_writes() {
+        let j = Journal {
+            asked: 12,
+            written: BTreeMap::from([(4, 8), (5, 12)]),
+            found: Vec::new(),
+            ahead: vec![(4, 6)],
+            ahead_asked: 8,
+            kept: true,
+        };
+        let (epoch, written) = ahead_answer(&j, 4, 6).unwrap();
+        assert_eq!(epoch, 12);
+        assert_eq!(written, [(4, 8), (5, 12)]);
+        // Once a full page is copied, the same write no longer makes it stale.
+        assert!(written.iter().all(|&(_, write)| write <= epoch));
+        assert!(ahead_answer(&j, 5, 7).is_none());
+        assert!(ahead_answer(&j, 5, 5).is_none());
+    }
+
+    #[test]
+    fn empty_ranges_do_not_open_guarded_blocks() {
+        let mut g = Guards {
+            protected: BTreeSet::from([1]),
+            clean: BTreeSet::from([1]),
+            absent: BTreeSet::new(),
+        };
+        assert!(!open(&mut g, BLOCK + 8, BLOCK + 8));
+        assert!(g.protected.contains(&1));
+        assert!(g.clean.contains(&1));
+        assert!(writes(PAGE + 1, PAGE + 1, true).is_none());
+        assert!(asked(PAGE + 1, PAGE + 1).is_none());
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
