@@ -2331,6 +2331,13 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // Fold constant bit-field masks used by the title to construct descriptor words.
+    // Adapted from fxceless/victory-fork#799.
+    if inst.name() == "s_bfm_b32" {
+        let width = lane_of(*src.first()?)? & 31;
+        let offset = lane_of(*src.get(1)?)? & 31;
+        return Some(Moved::Const(((1u32 << width) - 1) << offset));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2381,6 +2388,26 @@ pub(crate) mod tests {
     use crate::native::RootType::*;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn constant_descriptor_bit_masks() {
+        // SOP2 s_bfm_b32 s0, width, offset; inline integer sources.
+        for (width, offset, expected) in [
+            (0u32, 0u32, 0u32),
+            (5, 3, 0xf8),
+            (31, 1, 0xffff_fffe),
+            (32, 7, 0),
+            (4, 30, 0xc000_0000),
+            (3, 33, 0xe),
+        ] {
+            let word = 0x8000_0000 | (0x24 << 23) | ((128 + offset) << 8) | (128 + width);
+            let code: Vec<u8> = [word, S_ENDPGM].iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let inst = p.blocks.iter().flat_map(|b| &b.insts)
+                .find(|i| i.name() == "s_bfm_b32").expect("decoded bit-field mask");
+            assert!(matches!(copy_source(inst, 0), Some(Moved::Const(v)) if v == expected));
+        }
+    }
 
     fn track_words(words: &[u32], layout: &[RootParam], stage: HwStage) -> Resources {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

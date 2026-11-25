@@ -660,7 +660,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&physical, base, n * PAGE);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -729,7 +729,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&physical, to, len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -851,6 +851,22 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// Include whole views that unmap temporarily removes and restores outside
+/// the requested interval. Physical state is held by the caller.
+fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
+    let end = base.saturating_add(len);
+    let holding = |at: usize| {
+        physical.views.range(..=at).next_back()
+            .filter(|(start, (size, _))| at < start.saturating_add(*size))
+            .map(|(start, (size, _))| (*start, start.saturating_add(*size)))
+    };
+    let lo = holding(base).map_or(base, |(start, _)| start.min(base));
+    let hi = if len == 0 { end } else {
+        holding(end - 1).map_or(end, |(_, stop)| stop.max(end))
+    };
+    victory_gpu::title_memory_remapping_range(lo, hi.saturating_sub(lo).max(1))
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
