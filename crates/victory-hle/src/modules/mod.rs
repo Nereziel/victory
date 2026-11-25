@@ -65,6 +65,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(dstorage::module());
     #[cfg(windows)]
+    if victory_gpu::ffx::enabled() {
+        all.push(ffx::module());
+    }
+    #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]
     all.push(lifecycle::module());
