@@ -3252,6 +3252,12 @@ fn late_line(frames: f64) {
     }
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [unwatched, unasked, capped, unsnapped] =
+            crate::shadow::merge_fallback_stats().map(|n| n as f64 / frames);
+        tracing::info!(
+            unwatched, unasked, capped, unsnapped,
+            "write merge fallback causes per frame"
+        );
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
              {runs:.0} changed runs, {:.2} MB",
@@ -6809,6 +6815,7 @@ impl Meter {
             );
         }
         late_line(frames);
+        crate::indirect::line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
         let [card_passes, card_pieces, card_compares] =
