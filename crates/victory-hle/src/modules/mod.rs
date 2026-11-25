@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+mod ffx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -62,6 +64,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    #[cfg(windows)]
+    if victory_gpu::ffx::enabled() {
+        all.push(ffx::module());
+    }
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]

@@ -391,7 +391,15 @@ fn translate(
     };
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
-    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // Raw sources can extend to the end of the containing file. Match
+    // warm() and the runtime's container-sized hash, not trailing bytes.
+    let bytes = bytes.as_ref();
+    let bytes = bytes.get(0x18..0x1c)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .and_then(|b| bytes.get(..u32::from_le_bytes(b) as usize))
+        .filter(|b| b.len() >= 0x20)
+        .unwrap_or(bytes);
+    let hash = blake3::hash(bytes).to_hex()[..16].to_owned();
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -408,7 +416,7 @@ fn translate(
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
-    let Ok(container) = Container::parse(&bytes) else {
+    let Ok(container) = Container::parse(bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
@@ -434,7 +442,7 @@ fn translate(
                 .take(70)
                 .collect();
             let _ = std::fs::create_dir_all(dir);
-            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), bytes);
         }
     }
     if !lock(seen).insert(code) {
@@ -459,7 +467,7 @@ fn translate(
             if *n > was && was < 3 {
                 let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
                 let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), bytes);
             }
         }
     }

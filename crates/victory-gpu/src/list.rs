@@ -820,6 +820,12 @@ pub(crate) fn upscale(this: This, colour: This, output: This, render: [u32; 2], 
     true
 }
 
+/// Restore title bindings after a third-party SDK recorded its own commands.
+#[cfg(windows)]
+pub(crate) fn restore_after_external(this: This, list: &crate::host::HostList) {
+    with_state(this, |_, state| state.replay(list));
+}
+
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {

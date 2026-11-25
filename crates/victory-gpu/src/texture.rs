@@ -655,12 +655,17 @@ impl Staging {
 
     /// The read a refresh that only asked left for later; the caller
     /// holds title memory still. Returns the bytes read.
-    fn read_held(&self) -> usize {
+    fn read_held(&self, sharded: bool) -> usize {
         let whole = std::time::Instant::now();
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let Some(unseen) = last.waiting.take() else {
             return 0;
         };
+        // In sharded mode the worker holds only its own texture's range,
+        // and acquires it after the texture mutex, like refresh_timed.
+        let _mapped = sharded.then(|| waited(2, || {
+            crate::watch::title_memory_reading_range(self.memory as usize, self.size)
+        }));
         let read = self.read_now(&mut last, self.size, unseen);
         REFRESH_WAITS[3].fetch_add(whole.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         read
@@ -719,7 +724,7 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64) % HASH_EVERY == 0;
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             // Linear pictures of one level are what the processor draws (the
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
@@ -743,12 +748,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start, size))
         };
         self.read_now(last, size, unseen)
     }
@@ -1164,10 +1169,15 @@ pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
     }
     if !waiting.is_empty() {
         let held = std::time::Instant::now();
-        let _mapped = waited(2, crate::watch::title_memory_reading);
+        let sharded = crate::watch::mapping_shards();
+        let _mapped = (!sharded).then(|| waited(2, crate::watch::title_memory_reading));
         // The wait is every texture's, as it was when each took the lock.
         REFRESH_WAITS[3].fetch_add(held.elapsed().as_micros() as u64, Relaxed);
-        let spare = std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 12);
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        static THREADS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let requested = *THREADS.get_or_init(|| std::env::var("VICTORY_TEXTURE_THREADS")
+            .ok().and_then(|v| v.parse::<usize>().ok()));
+        let spare = requested.unwrap_or(available / 2).clamp(1, available.min(12));
         let threads = waiting.len().div_ceil(4).min(spare);
         BATCHES[0].fetch_add(1, Relaxed);
         BATCHES[1].fetch_add(waiting.len() as u64, Relaxed);
@@ -1176,7 +1186,7 @@ pub(crate) fn refresh_all(stagings: &[Arc<Staging>]) {
         let next = std::sync::atomic::AtomicUsize::new(0);
         let work = || {
             while let Some(staging) = waiting.get(next.fetch_add(1, Relaxed)) {
-                total.fetch_add(staging.read_held(), Relaxed);
+                total.fetch_add(staging.read_held(sharded), Relaxed);
             }
         };
         if threads <= 1 {

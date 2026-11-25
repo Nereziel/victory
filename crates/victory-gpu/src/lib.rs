@@ -64,6 +64,8 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
+pub mod ffx;
+#[cfg(windows)]
 mod upscale;
 #[cfg(windows)]
 mod fps_overlay;
@@ -76,5 +78,6 @@ pub use upscale::hook as upscaler_dispatch;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+    Remapping, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_remapping_range, writing as kernel_will_write,
 };

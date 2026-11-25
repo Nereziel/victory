@@ -566,26 +566,59 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// An immutable snapshot of the resolved physical destination. Keep its
+/// section references alive until DirectStorage completes (KLBF Lab).
+pub(crate) struct PageRuns {
+    runs: Vec<(Slice, usize)>,
+    within: usize,
+    len: usize,
+}
+
+pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Option<PageRuns> {
+    Some(PageRuns { runs: runs(pages, offset, len)?, within: offset % PAGE, len })
+}
+
+impl PageRuns {
+    pub(crate) fn window(&self) -> Option<PageWindow> {
+        let [(slice, n)] = self.runs.as_slice() else {
+            return None;
+        };
+        Some(PageWindow {
+            view: View::map(slice, *n)?,
+            within: self.within,
+            len: self.len,
+            slice: slice.clone(),
+        })
+    }
+
+    pub(crate) fn write(&self, data: &[u8]) -> bool {
+        if data.len() > self.len {
+            return false;
+        }
+        let (mut within, mut done) = (self.within, 0);
+        for (slice, n) in &self.runs {
+            if done == data.len() {
+                break;
+            }
+            let Some(mut view) = View::map(slice, *n) else {
+                return false;
+            };
+            let k = (n * PAGE - within).min(data.len() - done);
+            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+            (within, done) = (0, done + k);
+            written(slice, *n);
+        }
+        done == data.len()
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
-        };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        (within, done) = (0, done + k);
-        written(slice, *n);
-    }
-    true
+    resolve_pages(pages, offset, data.len()).is_some_and(|runs| runs.write(data))
 }
 
 /// After writes into `n` pages from `slice` on through a view of our own:
@@ -635,16 +668,7 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-        slice: slice.clone(),
-    })
+    resolve_pages(pages, offset, len)?.window()
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
@@ -660,7 +684,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&physical, base, n * PAGE);
     unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
         return address;
@@ -729,7 +753,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing(&physical, to, len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -851,6 +875,22 @@ fn commit_limit_message(
         "Close other applications or increase the Windows paging file size, then retry.\n",
     );
     message
+}
+
+/// Include whole views that unmap temporarily removes and restores outside
+/// the requested interval. Physical state is held by the caller.
+fn changing(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
+    let end = base.saturating_add(len);
+    let holding = |at: usize| {
+        physical.views.range(..=at).next_back()
+            .filter(|(start, (size, _))| at < start.saturating_add(*size))
+            .map(|(start, (size, _))| (*start, start.saturating_add(*size)))
+    };
+    let lo = holding(base).map_or(base, |(start, _)| start.min(base));
+    let hi = if len == 0 { end } else {
+        holding(end - 1).map_or(end, |(_, stop)| stop.max(end))
+    };
+    victory_gpu::title_memory_remapping_range(lo, hi.saturating_sub(lo).max(1))
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -1400,6 +1440,20 @@ mod tests {
         assert_eq!(shown(pages[3]), [at + 3 * PAGE]);
         XMemMapPhysicalPages(base, 8, std::ptr::null());
         assert!(pages.iter().all(|&p| shown(p).is_empty()));
+    }
+
+    #[test]
+    fn resolved_pages_do_not_follow_a_reused_page_list() {
+        let (a, b) = (allocate(1), allocate(1));
+        let mut list = [a[0]];
+        let snapshot = resolve_pages(&list, 3, 4).expect("resolved destination");
+        list[0] = b[0];
+        assert!(snapshot.write(&[1, 2, 3, 4]));
+        assert_eq!(&page_bytes(a[0])[3..7], &[1, 2, 3, 4]);
+        assert_eq!(&page_bytes(list[0])[3..7], &[0; 4]);
+        drop(snapshot);
+        assert_eq!(XMemFreePhysicalPages(1, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 
     #[test]

@@ -38,6 +38,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    gpu_upload_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
@@ -580,6 +581,17 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // ReBAR alone is not sufficient: ask the actual D3D12 device.
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let gpu_upload_supported = device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS16,
+                (&raw mut o16).cast(),
+                size_of_val(&o16) as u32,
+            )
+            .is_ok()
+            && o16.GPUUploadHeapSupported.as_bool();
+        tracing::info!(supported = gpu_upload_supported, "D3D12 GPU upload heaps");
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -609,6 +621,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
+            gpu_upload_supported,
             queue,
             fence,
             submitted: Mutex::new(0),
@@ -1763,6 +1776,33 @@ struct Chunk {
     _buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
+    // Released after the resource, including chunks retained by the pool.
+    _gpu_upload: Option<GpuUploadReservation>,
+}
+
+// Cap the entire pool of live GPU upload scratch allocations, including spares.
+// Keep the existing system-memory path if the cap or DXGI budget is reached.
+const GPU_UPLOAD_SCRATCH_CAP: u64 = 128 << 20;
+static GPU_UPLOAD_SCRATCH_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+struct GpuUploadReservation(u64);
+
+impl GpuUploadReservation {
+    fn new(size: u64) -> Option<Self> {
+        GPU_UPLOAD_SCRATCH_BYTES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(size).filter(|&total| total <= GPU_UPLOAD_SCRATCH_CAP)
+            })
+            .ok()?;
+        Some(Self(size))
+    }
+}
+
+impl Drop for GpuUploadReservation {
+    fn drop(&mut self) {
+        GPU_UPLOAD_SCRATCH_BYTES.fetch_sub(self.0, Ordering::Relaxed);
+    }
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -1852,8 +1892,23 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    // Only pooled scratch is eligible: CPU writes vertices, constants and
+    // indirect offsets, and the GPU reads them. Leave shared shadows,
+    // readbacks, oversized scratch and texture staging unchanged.
+    let (buffer, data, reservation) = match host.gpu_upload_scratch(size) {
+        Some((buffer, data, reservation)) => (buffer, data, Some(reservation)),
+        None => {
+            let (buffer, data) = host.upload_buffer(size)?;
+            (buffer, data, None)
+        }
+    };
+    name(&buffer, || {
+        if reservation.is_some() {
+            "list scratch (GPU upload)".into()
+        } else {
+            "list scratch".into()
+        }
+    });
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
@@ -1862,6 +1917,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         _buffer: buffer,
         data: data as usize,
         gpu,
+        _gpu_upload: reservation,
     })
 }
 
@@ -4818,7 +4874,7 @@ impl Host {
                 }
                 let frame = crate::queue::frame_count();
                 if let Some(dir) = timing_dump()
-                    && frame % 20 == 0
+                    && frame.is_multiple_of(20)
                     && let Ok(mut file) = std::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
@@ -6421,6 +6477,105 @@ impl Host {
             Ok(()) => buffer,
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
+                None
+            }
+        }
+    }
+
+    /// Opt-in ReBAR path, restricted to CPU-written/GPU-read scratch.
+    /// No UAV flag or resource transitions: GPU upload heaps stay GENERIC_READ.
+    fn gpu_upload_scratch(
+        &self,
+        size: u64,
+    ) -> Option<(ID3D12Resource, *mut u8, GpuUploadReservation)> {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_GPU_UPLOAD_SCRATCH").is_some_and(|v| v == "1"))
+            || !self.gpu_upload_supported
+        {
+            return None;
+        }
+        // Require a valid budget; preserve at least 20% of it for other resources.
+        let [budget, used, ..] = self.video_memory()?;
+        if used.saturating_add(size) > budget / 10 * 8 {
+            return None;
+        }
+        // The smallest pooled chunk is SCRATCH_FIRST, enough for the probe below.
+        if size < SCRATCH_FIRST {
+            return None;
+        }
+        let reservation = GpuUploadReservation::new(size)?;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: valid read-only GPU buffer description and a persistent CPU mapping.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            ).and_then(|()| {
+                let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                let no_reads = D3D12_RANGE { Begin: 0, End: 0 };
+                b.Map(0, Some(&no_reads), Some(&mut data))
+            })
+        };
+        match (made, buffer) {
+            (Ok(()), Some(buffer)) if !data.is_null() => {
+                // The normal deferred fill uses ReadProcessMemory into the
+                // mapped destination. Check that path as well as plain writes
+                // before a GPU upload scratch buffer can be used.
+                static WORKS: OnceLock<bool> = OnceLock::new();
+                let works = *WORKS.get_or_init(|| {
+                    let pattern = [0x5au8; 128];
+                    let to = data.cast::<u8>();
+                    // SAFETY: every eligible chunk is at least 256 KiB.
+                    // CPU reads of write-combined memory are slow; this
+                    // happens only once, before the buffer reaches any list.
+                    let same = unsafe {
+                        std::ptr::copy_nonoverlapping(pattern.as_ptr(), to, 64);
+                        let copied = read(pattern[64..].as_ptr(), to.add(64), 64);
+                        copied && std::slice::from_raw_parts(to, 128) == pattern
+                    };
+                    // SAFETY: the same mapped buffer, not yet in use.
+                    unsafe { std::ptr::write_bytes(to, 0, 128) };
+                    if !same {
+                        tracing::warn!("GPU upload scratch self-test failed; using normal upload memory");
+                    }
+                    same
+                });
+                if !works {
+                    return None;
+                }
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::info!(
+                    cap_mib = GPU_UPLOAD_SCRATCH_CAP >> 20,
+                    "GPU upload scratch active (VICTORY_GPU_UPLOAD_SCRATCH=1)"
+                ));
+                MADE[0].fetch_add(1, Ordering::Relaxed);
+                MADE[1].fetch_add(size, Ordering::Relaxed);
+                Some((buffer, data.cast(), reservation))
+            }
+            (result, _) => {
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::warn!(
+                    ?result, "GPU upload scratch allocation failed; using normal upload memory"
+                ));
                 None
             }
         }

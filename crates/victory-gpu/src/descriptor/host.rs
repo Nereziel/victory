@@ -241,6 +241,9 @@ static SWEEP: Mutex<(u32, [u64; 10], u64)> = Mutex::new((0, [0; 10], 0));
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
 static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+// KLBF Lab overflow recovery, represented in the same locked queue so the
+// consumer cannot lose an overflow between taking the queue and its flag.
+const ALL_REMAPPED: (u64, u64) = (0, u64::MAX);
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -282,6 +285,9 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
+    if ranges.first() == Some(&ALL_REMAPPED) {
+        return;
+    }
     // Pages are mapped one after the other.
     if let Some(last) = ranges.last_mut()
         && last.1 == start
@@ -290,10 +296,13 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
+        // No pass ran; do not silently forget stale texture views.
+        // Replace pending ranges with one full-rescan marker. Keep the
+        // original queue cap rather than allocating a much larger queue.
         STALE[2].fetch_add(ranges.len() as u64, Relaxed);
         ranges.clear();
+        ranges.push(ALL_REMAPPED);
+        return;
     }
     ranges.push((start, end));
 }
@@ -906,8 +915,15 @@ impl HostHeap {
         }
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            if ranges.first() == Some(&ALL_REMAPPED) {
+                placed.by_slot.keys().copied().collect()
+            } else {
+                ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            }
         };
+        if ranges.first() == Some(&ALL_REMAPPED) {
+            tracing::info!(slots = slots.len(), "remap queue overflow: rescan all placed texture slots");
+        }
         slots.sort_unstable();
         slots.dedup();
         // A table's slot waits for its draw, as a write of it does: the
@@ -1067,6 +1083,36 @@ impl HostHeap {
                 }
             }
         }
+    }
+
+    /// Whether host slot `index` is made from the very record the title
+    /// has at `handle` now. Its host texture then exists (a slot keeps what
+    /// it views), so bringing that texture up to date takes no memory of
+    /// the card.
+    pub(crate) fn texture_slot_made_from(&self, index: u32, handle: u64) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag != VIEW_TAG {
+            return false;
+        }
+        // And the slot holds a host resource: a slot is also noted as made
+        // from a view the host could not make (`make` gave nothing, the
+        // slot is null and keeps nothing). The host copy of such a
+        // texture is held by no slot, may have been let go, and would be
+        // made anew here, with the card full. `made` first, then `kept`,
+        // as `mirror` takes them.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
+            && self
+                .kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(index as usize)
+                .is_some_and(Option::is_some)
     }
 
     /// The memory of the texture title slot `index` views is not mapped

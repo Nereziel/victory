@@ -78,14 +78,20 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
+            "VICTORY_WAVE_ZERO_MASK",
             "VICTORY_F16_NEAREST",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
+            // Unset and empty are distinct for presence-based switches.
+            // Adapted from fxceless/victory-fork#1132.
             if let Some(value) = std::env::var_os(name) {
+                hash.update(&[1]);
                 hash.update(value.as_encoded_bytes());
+            } else {
+                hash.update(&[0]);
             }
             hash.update(&[0]);
         }

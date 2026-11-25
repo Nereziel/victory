@@ -1423,12 +1423,19 @@ pub(crate) fn room() -> bool {
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 5_000;
     const IDLE_FRAMES: u64 = 4;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
+    // Inspired by Neptune's pressure-dependent texture retention.
+    // Keep the original five-second safety floor and all reference checks.
+    static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let idle_ms = if *ADAPTIVE.get_or_init(|| std::env::var_os("VICTORY_ADAPTIVE_TEXTURE_IDLE").is_some_and(|v| v == "1")) {
+        texture_idle_ms(crate::host::host().and_then(|h| h.video_memory()))
+    } else {
+        5_000
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -1443,7 +1450,7 @@ pub(crate) fn let_go_idle() {
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), IDLE_MS, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -3691,5 +3698,28 @@ float4 lit() : SV_Target { return 1.0; }
         // The resource keeps the heap alive.
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
+    }
+}
+
+#[cfg(windows)]
+fn texture_idle_ms(video: Option<[u64; 4]>) -> u64 {
+    match video {
+        Some([budget, used, ..]) if budget > 0 && used < budget / 10 * 7 => 15_000,
+        Some([budget, used, ..]) if budget > 0 && used < budget / 10 * 8 => 10_000,
+        _ => 5_000,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod adaptive_idle_tests {
+    use super::texture_idle_ms;
+
+    #[test]
+    fn retains_textures_longer_only_with_budget_headroom() {
+        assert_eq!(texture_idle_ms(Some([100, 69, 0, 0])), 15_000);
+        assert_eq!(texture_idle_ms(Some([100, 70, 0, 0])), 10_000);
+        assert_eq!(texture_idle_ms(Some([100, 80, 0, 0])), 5_000);
+        assert_eq!(texture_idle_ms(Some([0, 0, 0, 0])), 5_000);
+        assert_eq!(texture_idle_ms(None), 5_000);
     }
 }

@@ -57,13 +57,12 @@ pub fn run(root: &Path, target: &Path) -> Result<()> {
     // watch for it while it is missing (that would rebuild the crate every
     // time): make cargo rerun them. (This tree has only victory.exe's; the
     // test executables' exports of the original PR are not taken.)
-    for script in ["apps/victory/build.rs"] {
-        std::fs::File::options()
-            .append(true)
-            .open(root.join(script))
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
-            .with_context(|| format!("touching {script}"))?;
-    }
+    let script = "apps/victory/build.rs";
+    std::fs::File::options()
+        .append(true)
+        .open(root.join(script))
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+        .with_context(|| format!("touching {script}"))?;
     Ok(())
 }
 
@@ -241,24 +240,10 @@ mod tests {
     #[test]
     fn version_matches_the_sdk_version_all_exports() {
         let minor = VERSION.split('.').nth(1).unwrap();
-        for (path, source) in [
-            (
-                "apps/victory/src/agility.rs",
-                include_str!("../../apps/victory/src/agility.rs"),
-            ),
-            (
-                "crates/victory-shader/src/agility.rs",
-                include_str!("../../crates/victory-shader/src/agility.rs"),
-            ),
-            (
-                "crates/victory-gpu/src/agility.rs",
-                include_str!("../../crates/victory-gpu/src/agility.rs"),
-            ),
-        ] {
-            assert!(
-                source.contains(&format!("D3D12SDKVersion: u32 = {minor};")),
-                "{path} must export D3D12SDKVersion = {minor}"
-            );
-        }
+        let source = include_str!("../../apps/victory/src/agility.rs");
+        assert!(
+            source.contains(&format!("D3D12SDKVersion: u32 = {minor};")),
+            "apps/victory/src/agility.rs must export D3D12SDKVersion = {minor}"
+        );
     }
 }

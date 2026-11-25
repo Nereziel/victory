@@ -368,7 +368,7 @@ struct Lane {
     unsubmitted: Vec<Command>,
     /// Submitted, by sequence number: reads not started, status entries
     /// not written, reads running, and failures not yet reported.
-    reads: VecDeque<(u64, Request)>,
+    reads: VecDeque<(u64, Request, Option<super::xmem::PageRuns>)>,
     statuses: VecDeque<(u64, Status)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
@@ -385,6 +385,7 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    pages: Option<super::xmem::PageRuns>,
     staging: u64,
 }
 
@@ -450,7 +451,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
-        let result = execute(&job.request);
+        let result = execute(&job.request, job.pages.as_ref());
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -506,14 +507,14 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, request) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let (_, request, _) = lane.reads.front()?;
+        let staging = staging_bytes(request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, request, pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -525,6 +526,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            pages,
             staging,
         })
     }
@@ -542,6 +544,10 @@ impl Lanes {
 
     /// Moves a queue's enqueued commands to the workers.
     fn submit(&mut self, id: u64) {
+        self.submit_with_pages(id, false);
+    }
+
+    fn submit_with_pages(&mut self, id: u64, explicit: bool) {
         let Some(class) = self.lanes.get(&id).map(|l| l.class) else {
             return;
         };
@@ -564,7 +570,10 @@ impl Lanes {
             let seq = self.next_seq;
             self.next_seq += 1;
             match command {
-                Command::Read(request) => lane.reads.push_back((seq, request)),
+                Command::Read(request) => {
+                    let pages = if explicit && snapshot_at_submit() { resolve_destination(&request) } else { None };
+                    lane.reads.push_back((seq, request, pages));
+                }
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
@@ -772,7 +781,7 @@ extern "system" fn submit(this: QueueRef) {
     let mut lanes = scheduler.lock();
     let pending = lanes.lanes.get(&id).map_or(0, |l| l.unsubmitted.len());
     tracing::debug!(commands = pending, "dstorage: submit");
-    lanes.submit(id);
+    lanes.submit_with_pages(id, true);
     scheduler.work.notify_all();
 }
 
@@ -784,8 +793,41 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
+// Adapted from KLBF Lab's submit-time page resolution. Only explicit
+// submits are changed; automatic submission and unresolved lists keep
+// the old late path to avoid blocking a title that fills a whole queue.
+fn snapshot_at_submit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_LIST").is_some_and(|v| v == "submit"))
+}
+
+fn resolve_destination(request: &Request) -> Option<super::xmem::PageRuns> {
+    if request.options & PAGE_DESTINATION == 0 || request.destination.is_null() {
+        return None;
+    }
+    let len = if request.options & (ZLIB | BCPACK) == 0 {
+        if request.source_size > request.destination_size {
+            return None;
+        }
+        request.source_size
+    } else {
+        request.destination_size
+    } as usize;
+    if len == 0 {
+        return None;
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let n = (offset + len).div_ceil(PAGE);
+    // SAFETY: same page-array contract as filled(); take the numbers
+    // immediately without waiting under the scheduler mutex.
+    let pages: Vec<usize> = (0..n).map(|i| unsafe {
+        request.destination.cast::<usize>().add(i).read_volatile()
+    }).collect();
+    super::xmem::resolve_pages(&pages, offset, len)
+}
+
 /// Reads, inflates and/or unpacks, and writes one request.
-fn execute(request: &Request) -> Result<(), HRESULT> {
+fn execute(request: &Request, pages: Option<&super::xmem::PageRuns>) -> Result<(), HRESULT> {
     victory_gpu::zone!("dstorage request");
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
@@ -815,7 +857,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
+        return into_destination(request, pages, size, |out| read_into(request, out).map(|()| size))
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
@@ -829,7 +871,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
+    into_destination(request, pages, size, |out| match tables {
         Some(tables) => {
             victory_gpu::zone!("bcpack decode");
             bcpack::decode(bc, &source, out, tables)
@@ -950,6 +992,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
+    resolved: Option<&super::xmem::PageRuns>,
     len: usize,
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
@@ -961,6 +1004,14 @@ fn into_destination(
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         return fill(out).map(drop);
+    }
+    if let Some(runs) = resolved {
+        if let Some(mut window) = runs.window() {
+            return fill(window.bytes()).map(drop);
+        }
+        let mut data = vec![0; len];
+        let n = fill(&mut data)?;
+        return if runs.write(&data[..n]) { Ok(()) } else { Err(E_INVALIDARG) };
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];

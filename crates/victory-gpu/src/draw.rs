@@ -1350,15 +1350,20 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type Spans = std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        type HeapPlan = (u64, Ranges, Option<std::sync::Arc<Spans>>);
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapPlan>>> =
             std::sync::Mutex::new(None);
+        static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reuse = *REUSE.get_or_init(|| std::env::var_os("VICTORY_HEAP_PLAN_REUSE").is_some_and(|v| v == "1"));
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, cached_spans) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), None));
         let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
+        let full_pass = *passes % 16 == 0;
+        let slots = if full_pass {
             ranges.clear();
             host.buffer_slots()
         } else {
@@ -1404,15 +1409,28 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        // Reuse only the aggregation of unchanged descriptor ranges. The
+        // existing periodic full pass and every actual buffer refresh stay.
+        // Invalidate even when a changed slot disappeared or failed to mirror.
+        if full_pass || !slots.is_empty() || !reuse {
+            *cached_spans = None;
         }
+        let spans = if let Some(spans) = cached_spans.as_ref() {
+            spans.clone()
+        } else {
+            let mut spans = Spans::new();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            let spans = std::sync::Arc::new(spans);
+            if reuse {
+                *cached_spans = Some(spans.clone());
+            }
+            spans
+        };
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
@@ -1562,6 +1580,15 @@ impl State {
         } else {
             (PER_FRAME, SPAN)
         };
+        // KLBF Lab exposes both queue budgets. Retain this fork's normal
+        // and catch-up defaults unless the user requests an override.
+        static LIMITS: std::sync::OnceLock<(Option<u64>, Option<u64>)> = std::sync::OnceLock::new();
+        let (mb, ms) = *LIMITS.get_or_init(|| {
+            let read = |name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            (read("VICTORY_TEXTURE_QUEUE_MB"), read("VICTORY_TEXTURE_QUEUE_MS"))
+        });
+        let per_frame = mb.map_or(per_frame, |v| v.clamp(16, 1024) << 20);
+        let span = ms.map_or(span, |v| std::time::Duration::from_millis(v.clamp(10, 1500)));
         let began = std::time::Instant::now();
         let mut looked = 0u64;
         for (index, write) in due {
@@ -1622,11 +1649,19 @@ impl State {
             // From here on a host texture is made: not without room. The
             // slot stays due.
             if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+                // Trexies 310c6eb6: existing resident textures can still
+                // be refreshed when the budget prevents new allocations.
+                static REUPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let enabled = *REUPLOAD.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_some_and(|v| v == "1"));
+                if !enabled || !heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)) {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::info!("refreshing existing texture despite full VRAM budget"));
             }
             let making = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
@@ -2293,7 +2328,7 @@ impl State {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::title_memory_reading_range(from, n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
