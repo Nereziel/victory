@@ -47,7 +47,7 @@
 //! 16,352 of 16,384 pages read zeros with the handle closed, none with it
 //! open (the test below). `VICTORY_LIBRARY_HANDLE=0`: closed, as before.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
@@ -640,7 +640,7 @@ pub(crate) fn save(now: bool) {
     // With what earlier runs listed: a run that asks for no title pipeline
     // (`victory warm`) wrote an empty list over theirs, and the next world
     // began with every pipeline still to be asked for.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let used: Vec<String> = used().as_ref().map(|s| s.order.iter().cloned().collect()).unwrap_or_default();
     let library_written = if serialized_added > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if library_written.is_err() {
         // Stores since serialization may already have incremented added.
@@ -725,19 +725,52 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
     std::fs::rename(&tmp, path)
 }
 
-/// Title pipeline keys requested by draws or dispatches (this run and the last).
-static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// Bounded early list, oldest request first. Once full, keep learning
+/// rather than permanently freezing the first 8192 pipelines encountered.
+#[derive(Default)]
+struct EarlyKeys {
+    keys: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl EarlyKeys {
+    fn touch(&mut self, key: &str, limit: usize) -> bool {
+        if limit == 0 || key.is_empty() || self.order.back().is_some_and(|k| k == key) {
+            return false;
+        }
+        if self.keys.contains(key) {
+            if let Some(at) = self.order.iter().position(|k| k == key) {
+                self.order.remove(at);
+            }
+        } else {
+            self.keys.insert(key.to_owned());
+        }
+        self.order.push_back(key.to_owned());
+        while self.order.len() > limit {
+            if let Some(old) = self.order.pop_front() {
+                self.keys.remove(&old);
+            }
+        }
+        true
+    }
+}
+
+/// Title pipeline keys requested by draws or dispatches (this run and earlier).
+static USED: Mutex<Option<EarlyKeys>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
 
-fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+fn used() -> std::sync::MutexGuard<'static, Option<EarlyKeys>> {
     let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
     if used.is_none() {
         let listed = DIR
             .get()
             .and_then(|d| std::fs::read_to_string(d.join(EARLY_FILE)).ok())
             .unwrap_or_default();
-        let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
-        tracing::info!(pipelines = set.len(), "title pipelines to start early");
+        let mut set = EarlyKeys::default();
+        for key in listed.lines() {
+            set.touch(key, EARLY_MAX);
+        }
+        tracing::info!(pipelines = set.keys.len(), "title pipelines to start early");
         *used = Some(set);
     }
     used
@@ -745,14 +778,14 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
 pub(crate) fn wanted_early(key: &str) -> bool {
-    used().as_ref().is_some_and(|s| s.contains(key))
+    used().as_ref().is_some_and(|s| s.keys.contains(key))
 }
 
 /// A draw or dispatch requested the title pipeline with `key`.
 pub(crate) fn note_used(key: &str) {
     let mut used = used();
-    let set = used.get_or_insert_with(HashSet::new);
-    if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
+    let set = used.get_or_insert_with(EarlyKeys::default);
+    if set.touch(key, EARLY_MAX) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
 }
@@ -760,6 +793,25 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_keys_keep_learning_at_capacity() {
+        let mut keys = EarlyKeys::default();
+        for key in ["a", "b", "c", "a", "d"] {
+            assert!(keys.touch(key, 3));
+        }
+        assert_eq!(keys.order.iter().map(String::as_str).collect::<Vec<_>>(), ["c", "a", "d"]);
+        assert!(!keys.keys.contains("b"));
+        assert_eq!(keys.keys.len(), 3);
+        assert!(!keys.touch("d", 3));
+        assert!(!keys.touch("", 3));
+        let mut restored = EarlyKeys::default();
+        for key in &keys.order {
+            restored.touch(key, 3);
+        }
+        assert_eq!(restored.order, keys.order);
+        assert_eq!(restored.keys, keys.keys);
+    }
 
     #[test]
     fn periodic_publication_skips_an_active_save() {
