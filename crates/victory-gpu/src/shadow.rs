@@ -555,6 +555,21 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AVX2.get_or_init(|| {
+            std::env::var_os("VICTORY_AVX2_MERGE").is_some_and(|v| v == "1")
+                && std::arch::is_x86_feature_detected!("avx2")
+        }) {
+            // SAFETY: AVX2 support has been checked at runtime.
+            return unsafe { merge_piece_avx2(now, held, title) };
+        }
+    }
+    merge_piece_scalar(now, held, title)
+}
+
+fn merge_piece_scalar(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
     let mut differs = 0u8;
     for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
         let wrote = if *n != *h { 0xffu8 } else { 0 };
@@ -564,6 +579,98 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
         *h = (*h & !wrote) | (*n & wrote);
     }
     differs != 0
+}
+
+// Adapted from rorodev6/victory PR #1 (GPL-3.0-or-later).
+// Keep this path opt-in for controlled A/B tests on the same executable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_piece_avx2(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    use std::arch::x86_64::*;
+
+    let len = now.len().min(held.len()).min(title.len());
+    let mut i = 0;
+    let mut diff_acc = _mm256_setzero_si256();
+    let np = now.as_ptr();
+    let hp = held.as_mut_ptr();
+    let tp = title.as_mut_ptr();
+
+    while len - i >= 32 {
+        // SAFETY: all three unaligned 32-byte accesses are within their slices.
+        unsafe {
+            let n = _mm256_loadu_si256(np.add(i).cast::<__m256i>());
+            let h = _mm256_loadu_si256(hp.add(i).cast::<__m256i>());
+            let eq = _mm256_cmpeq_epi8(n, h);
+            if _mm256_movemask_epi8(eq) != -1 {
+                let t = _mm256_loadu_si256(tp.add(i).cast::<__m256i>());
+                let merged = _mm256_blendv_epi8(n, t, eq);
+                diff_acc = _mm256_or_si256(diff_acc, _mm256_xor_si256(merged, t));
+                _mm256_storeu_si256(tp.add(i).cast::<__m256i>(), merged);
+                _mm256_storeu_si256(hp.add(i).cast::<__m256i>(), n);
+            }
+        }
+        i += 32;
+    }
+
+    let mut differs = _mm256_testz_si256(diff_acc, diff_acc) == 0;
+    if i < len {
+        differs |= merge_piece_scalar(&now[i..len], &mut held[i..len], &mut title[i..len]);
+    }
+    differs
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx2_merge_tests {
+    use super::{merge_piece_avx2, merge_piece_scalar};
+
+    #[test]
+    fn avx2_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut byte = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (seed >> 32) as u8
+        };
+        for len in [0usize, 1, 15, 31, 32, 33, 63, 64, 65, 127, 256, 4095, 4096, 65536] {
+            for offset in [0usize, 1, 7, 31] {
+                for density in [0u8, 1, 20, 128, 255] {
+                    let held: Vec<u8> = (0..len + offset + 8).map(|_| byte()).collect();
+                    let mut now = held.clone();
+                    let mut title = held.clone();
+                    for k in offset..offset + len {
+                        if byte() < density {
+                            now[k] ^= 0x5a;
+                        }
+                        if byte() < 64 {
+                            title[k] ^= 0xa5;
+                        }
+                    }
+                    let (mut h1, mut t1) = (held.clone(), title.clone());
+                    let (mut h2, mut t2) = (held.clone(), title.clone());
+                    // Include mismatched slice lengths: zip stops at the shortest.
+                    let end = offset + len;
+                    let a = merge_piece_scalar(
+                        &now[offset..end + 2],
+                        &mut h1[offset..end + 1],
+                        &mut t1[offset..end],
+                    );
+                    // SAFETY: the test checks AVX2 above.
+                    let b = unsafe {
+                        merge_piece_avx2(
+                            &now[offset..end + 2],
+                            &mut h2[offset..end + 1],
+                            &mut t2[offset..end],
+                        )
+                    };
+                    assert_eq!(a, b, "len={len}, offset={offset}, density={density}");
+                    assert_eq!(h1, h2);
+                    assert_eq!(t1, t2);
+                }
+            }
+        }
+    }
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
