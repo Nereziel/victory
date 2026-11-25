@@ -13,6 +13,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Opt-in until the copied descriptor path has been tested on real hardware.
+pub(crate) fn heap_sync_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_some_and(|v| v == "1"))
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -26,6 +32,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Last observed title record, including deferred views that are not yet made.
+    /// Allocated only for the experimental raw-copy sync.
+    observed: Option<Mutex<Vec<[u32; 3]>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -704,6 +713,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            observed: heap_sync_enabled().then(|| Mutex::new(vec![[0; 3]; count as usize])),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, taken)),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC - 1),
@@ -1519,10 +1529,30 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, handle, record, for_draw, false)
+    }
+
+    /// A record already read through the kernel from a changed heap page.
+    /// Never dereference the title address again here.
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: [u32; 3]) {
+        if index < self.count && self.observed.is_some() {
+            self.mirror_record(index, handle, record, false, true);
+        }
+    }
+
+    fn mirror_record(&self, index: u32, handle: u64, record: [u32; 3], for_draw: bool, copied: bool) -> Option<View> {
+        let [tag, i, generation] = record;
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(observed) = &self.observed {
+            let mut observed = observed.lock().unwrap_or_else(|e| e.into_inner());
+            let previous = &mut observed[index as usize];
+            if copied && *previous == record {
+                return None;
+            }
+            *previous = record;
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
@@ -1531,7 +1561,7 @@ impl HostHeap {
                 made[index as usize] = 0;
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
-            } else if for_draw {
+            } else if for_draw || copied {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
