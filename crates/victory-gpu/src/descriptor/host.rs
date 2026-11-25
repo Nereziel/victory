@@ -2088,7 +2088,9 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+    if !buffer_view_ok(desc.Format, first, count, stride, raw, width)
+        || (!raw && stride == 0 && !typed_store(desc.Format.0 as u32))
+    {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let why = if raw { "raw, refused by the host" } else { "refused by the host" };
         left_null(why, true, address, len, element, first);
@@ -2110,6 +2112,37 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     Some(Some(shadow.buffer.clone()))
+}
+
+/// Cache format support for the actual host device. VIctory ea488a9
+/// (#2462): a typed UAV in an unsupported format may remove the device.
+/// Structured/raw buffer UAVs are checked separately by buffer_view_ok.
+fn typed_store(format: u32) -> bool {
+    static SUPPORT: Mutex<std::collections::HashMap<u32, bool>> =
+        Mutex::new(std::collections::HashMap::new());
+    let mut support = SUPPORT.lock().unwrap_or_else(|e| e.into_inner());
+    *support.entry(format).or_insert_with(|| {
+        let Some(host) = host() else { return false };
+        let mut data = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the query writes to a live structure of the stated size.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut data).cast(),
+                std::mem::size_of_val(&data) as u32,
+            )
+        };
+        let allowed = asked.is_ok()
+            && data.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+            && data.Support2.0 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+        if !allowed {
+            tracing::warn!(format, "unsupported typed UAV store format; view left null");
+        }
+        allowed
+    })
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -2154,7 +2187,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        return !typeless && (!unordered || typed_store(own));
     }
     // A view of a target whose format the host refuses, in the title's
     // format: in the stand-in the host copy has.
@@ -2162,7 +2195,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         if let Some(format) = format {
             *format = d.Format;
         }
-        return true;
+        return !unordered || typed_store(own);
     }
     if family(view) != family(own) {
         once!(view, own, "view format of another family");
@@ -2173,7 +2206,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     {
         *format = d.Format;
     }
-    true
+    !unordered || typed_store(if typeless { view } else { own })
 }
 
 /// The title's unordered access view of a depth texture, as a view of the
