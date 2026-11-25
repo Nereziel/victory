@@ -9,7 +9,9 @@ param(
     [switch]$Release,            # use target\release instead of target\diag
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
-    [switch]$Warm                # redo the shader warm-up even if this build already did it
+    [switch]$Warm,               # redo the shader warm-up even if this build already did it
+    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','Combined')]
+    [string]$Benchmark = ''      # optional A/B test mode, one variable at a time
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
@@ -37,6 +39,19 @@ $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
 $env:VICTORY_CARD_BUFFERS_MB     = '1024'
 $env:VICTORY_JOIN_COPIES         = '1'
 $env:VICTORY_CARD_REHASH_RUNS    = '1'
+# Named benchmark modes control only the experiment switches. The normal
+# preset and the ability to set custom environment variables stay unchanged.
+if ($Benchmark) {
+    $env:VICTORY_AVX2_MERGE = '0'
+    $env:VICTORY_WIDE_MERGE = '0'
+    $env:VICTORY_WIDE_REFRESH = '0'
+    $env:VICTORY_CARD_WINDOWS_MB = '0'
+    if ($Benchmark -in @('AVX2','Combined')) { $env:VICTORY_AVX2_MERGE = '1' }
+    if ($Benchmark -in @('WideMerge','Combined')) { $env:VICTORY_WIDE_MERGE = '1' }
+    if ($Benchmark -in @('WideRefresh','Combined')) { $env:VICTORY_WIDE_REFRESH = '1' }
+    if ($Benchmark -in @('CardWindows','Combined')) { $env:VICTORY_CARD_WINDOWS_MB = '1024' }
+    Write-Host "Benchmark mode: $Benchmark"
+}
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 
 # Shader warm-up: without it every shader is translated and compiled while the game runs, behind a
@@ -58,8 +73,16 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
     }
 }
 
-$log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
+if ($Benchmark) {
+    $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
+    "benchmark=$Benchmark" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
+    Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
+        "$($_.Name)=$($_.Value)"
+    } | Add-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
+    Write-Host "Frame timing CSV: $env:VICTORY_FRAMETIME_DUMP"
+}
 "victory $build | console $console | $([Environment]::OSVersion.VersionString) | game $Game" | Set-Content (Join-Path $log 'run.txt') -Encoding utf8
 Write-Host "Log: $log\err.txt"
 $p = Start-Process -FilePath $exe -WorkingDirectory $root -PassThru `
