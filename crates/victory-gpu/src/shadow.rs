@@ -3015,7 +3015,8 @@ pub(crate) fn aligned_view(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if len == 0 || len > MAX_BYTES || address.checked_add(len).is_none() {
         return None;
     }
-    let size = len.next_multiple_of(256);
+    // D3D12 committed buffer allocation granularity, not just view size.
+    let size = len.next_multiple_of(64 << 10);
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(copy) = views.1.get(&(address, len)) {
         return Some(copy.clone());
