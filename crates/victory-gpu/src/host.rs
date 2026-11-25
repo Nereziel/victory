@@ -2231,9 +2231,25 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    // Raw title-memory copies covered by this list, independently for reads and writes.
+    memory_read_seen: usize,
+    memory_write_seen: usize,
 }
 
 impl Deferred {
+    fn memory_sync_range(&mut self, total: usize, writes: bool) -> (usize, usize) {
+        let read_from = self.memory_read_seen.min(total);
+        self.memory_read_seen = total;
+        let write_from = if writes {
+            let prev = self.memory_write_seen.min(total);
+            self.memory_write_seen = total;
+            prev
+        } else {
+            total
+        };
+        (read_from, write_from)
+    }
+
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
     fn hold_upload(&mut self, buffer: ID3D12Resource, size: u64) {
@@ -2554,6 +2570,20 @@ mod card_dispatch_tests {
 #[cfg(test)]
 mod relay_tests {
     use super::{flagged_pieces, landable};
+
+    #[test]
+    fn memory_watermarks_cover_copies_numbered_by_other_lists() {
+        let mut a = super::Deferred::default();
+        let mut b = super::Deferred::default();
+        assert_eq!(a.memory_sync_range(10, true), (0, 0));
+        assert_eq!(b.memory_sync_range(15, false), (0, 15));
+        assert_eq!(a.memory_sync_range(15, true), (10, 10));
+        assert_eq!(b.memory_sync_range(17, true), (15, 0));
+        a.memory_read_seen = 0;
+        assert_eq!(a.memory_sync_range(17, true), (0, 15));
+        assert_eq!(a.memory_sync_range(17, true), (17, 17));
+        assert_eq!(super::Deferred::default().memory_sync_range(17, true), (0, 0));
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -5793,6 +5823,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -6031,11 +6062,18 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// First numbered copies not yet refreshed or declared written by this list.
+    pub(crate) fn memory_sync_range(&self, total: usize, writes: bool) -> (usize, usize) {
+        self.deferred().memory_sync_range(total, writes)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.memory_read_seen = 0;
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
