@@ -72,6 +72,9 @@ pub(crate) struct Staging {
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
+    /// Retry the kernel after a bounded interval: a streamed allocation
+    /// may change its mapping type while the staging object survives.
+    watch_retry: Option<u64>,
     /// A refresh that only asked ([`refresh_all`]) found the texture is
     /// to be read in place: what it had learnt of unseen writes, for the
     /// read that follows with title memory held still.
@@ -686,8 +689,24 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        static GUARD_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let guard_only = *GUARD_ONLY.get_or_init(|| {
+            let enabled = std::env::var_os("VICTORY_TEXTURE_GUARD_ONLY").is_some_and(|v| v == "1");
+            tracing::info!(enabled, "texture guard-only fallback");
+            enabled
+        });
+        let frame = crate::frame::current();
+        let probe = !guard_only || last.watch_retry.is_none_or(|retry| frame >= retry);
+        let watched = if probe {
+            waited(1, || crate::watch::writes(start, start + size, false))
+        } else {
+            None
+        };
+        if let Some((now, written)) = watched {
+            // A return to kernel write-watch after guard mode needs a
+            // fresh copy even if the old guard watermark was newer.
+            let changed_mode = last.watch_retry.take().is_some();
+            if !changed_mode && last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
             last.asked = now;
@@ -700,6 +719,12 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
+        }
+        if guard_only && probe {
+            if last.watch_retry.is_none() {
+                last.asked = 0;
+            }
+            last.watch_retry = Some(frame.saturating_add(32));
         }
         // View memory has no write-watch, and a texture there was hashed
         // whole at every check: 229 MB and 51 ms a frame in a gameplay view
@@ -718,7 +743,13 @@ impl Staging {
         // another on the screen).
         let mut unseen = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || {
+                if guard_only {
+                    crate::watch::guard_writes(start, start + size)
+                } else {
+                    crate::watch::writes(start, start + size, true)
+                }
+            })
         {
             // Neptune: make the periodic fallback hash configurable. Keep
             // the original cadence by default; movie planes and recent
