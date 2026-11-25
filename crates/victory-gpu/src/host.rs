@@ -6499,6 +6499,10 @@ impl Host {
         if used.saturating_add(size) > budget / 10 * 8 {
             return None;
         }
+        // The smallest pooled chunk is SCRATCH_FIRST, enough for the probe below.
+        if size < SCRATCH_FIRST {
+            return None;
+        }
         let reservation = GpuUploadReservation::new(size)?;
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
@@ -6533,6 +6537,31 @@ impl Host {
         };
         match (made, buffer) {
             (Ok(()), Some(buffer)) if !data.is_null() => {
+                // The normal deferred fill uses ReadProcessMemory into the
+                // mapped destination. Check that path as well as plain writes
+                // before a GPU upload scratch buffer can be used.
+                static WORKS: OnceLock<bool> = OnceLock::new();
+                let works = *WORKS.get_or_init(|| {
+                    let pattern = [0x5au8; 128];
+                    let to = data.cast::<u8>();
+                    // SAFETY: every eligible chunk is at least 256 KiB.
+                    // CPU reads of write-combined memory are slow; this
+                    // happens only once, before the buffer reaches any list.
+                    let same = unsafe {
+                        std::ptr::copy_nonoverlapping(pattern.as_ptr(), to, 64);
+                        let copied = read(pattern[64..].as_ptr(), to.add(64), 64);
+                        copied && std::slice::from_raw_parts(to, 128) == pattern
+                    };
+                    // SAFETY: the same mapped buffer, not yet in use.
+                    unsafe { std::ptr::write_bytes(to, 0, 128) };
+                    if !same {
+                        tracing::warn!("GPU upload scratch self-test failed; using normal upload memory");
+                    }
+                    same
+                });
+                if !works {
+                    return None;
+                }
                 static FIRST: std::sync::Once = std::sync::Once::new();
                 FIRST.call_once(|| tracing::info!(
                     cap_mib = GPU_UPLOAD_SCRATCH_CAP >> 20,
