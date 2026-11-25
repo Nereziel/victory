@@ -27,6 +27,42 @@ pub(super) mod intersect;
 
 type Why = &'static str;
 
+/// DXIL handle properties for a known four-dword SRV/UAV buffer.
+fn size_only_buffer_props(used: &UsedResource) -> Option<((u32, u32), u32)> {
+    if used.dwords != 4 || !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+        return None;
+    }
+    let u = if used.kind == ResourceType::Uav { 0x1000 } else { 0 };
+    let stride = used.stride;
+    // A structured view is counted in elements, a raw view in bytes.
+    let props = if stride >= 4 && stride.is_multiple_of(4) {
+        (12 | u, stride)
+    } else {
+        (11 | u, 0)
+    };
+    Some((props, stride))
+}
+
+#[cfg(test)]
+#[test]
+fn size_only_descriptor_properties_require_known_buffer_kind() {
+    let mut used = UsedResource {
+        kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: 0,
+        lower_bound: 0, stride: 16, dwords: 4, user_data: 0, slot: 0,
+    };
+    assert_eq!(size_only_buffer_props(&used), Some(((12, 16), 16)));
+    used.kind = ResourceType::Uav;
+    assert_eq!(size_only_buffer_props(&used), Some(((12 | 0x1000, 16), 16)));
+    used.stride = 1;
+    assert_eq!(size_only_buffer_props(&used), Some(((11 | 0x1000, 0), 1)));
+    used.dwords = 8;
+    assert_eq!(size_only_buffer_props(&used), None);
+    used.dwords = 4;
+    used.kind = ResourceType::Cbv;
+    assert_eq!(size_only_buffer_props(&used), None);
+}
+
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -5664,6 +5700,12 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
+            // Neptune's size-only descriptor support, restricted to an
+            // explicitly described static buffer slot. Do not guess an image
+            // dimension or a buffer kind from the number of loaded words.
+            if count == 4 && self.descriptor_size_only(inst, site, code)? {
+                return Ok(());
+            }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
@@ -5826,6 +5868,70 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Reconstruct the record count of a buffer descriptor which is read
+    /// as data but never used by a buffer instruction (Neptune).
+    fn descriptor_size_only(&mut self, inst: &Inst, site: Site, code: u8) -> Result<bool, Why> {
+        if !std::env::var_os("VICTORY_DESC_DATA").is_some_and(|v| v == "1") {
+            return Ok(false);
+        }
+        let Some(a) = self.scalar.get(&site).copied() else {
+            return Ok(false);
+        };
+        let Some(rp) = self.x.native.layout.get(a.param) else {
+            return Ok(false);
+        };
+        if rp.root != RootType::Table || a.dynamic.is_some() || a.offset % 32 != 0 {
+            return Ok(false);
+        }
+        let src = Source::Loaded { load: site, first: 0 };
+        let Some(used) = self.used_kind(&src) else {
+            return Ok(false);
+        };
+        if used.table_offset_dwords != a.offset / 4 {
+            return Ok(false);
+        }
+        let Some((props, stride)) = size_only_buffer_props(used) else {
+            return Ok(false);
+        };
+        // Preserve the existing address-only path when no instruction reads
+        // the record count, including ray-tracing pointer walks.
+        let read_count = inst.write(Reg::S(code + 2)).is_some_and(|v| {
+            self.x.p.blocks.iter().flat_map(|b| &b.insts)
+                .any(|i| i.reads.iter().any(|r| r.1 == v))
+        });
+        if !read_count {
+            return Ok(false);
+        }
+        let h = self.handle(site, &src, false, props)?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = self.s.m.undef(i32t);
+        let d = self.s.op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let mut n = self.s.m.extract(c, d, 0);
+        if props.0 & 0xff == 11 && stride > 1 {
+            let k = self.s.m.i32(stride);
+            n = self.s.m.bin(c, Bin::UDiv, n, k);
+        }
+        let address = self.view_address(site);
+        for k in 0..4u8 {
+            let reg = Reg::S(code + k);
+            let value = match k {
+                0 => address.map(|(lo, _)| lo),
+                1 => address.map(|(_, hi)| hi),
+                2 => Some(n),
+                _ => None,
+            };
+            if let Some(v) = value {
+                self.write(inst, reg, v, None);
+            } else if let Some(v) = inst.write(reg) {
+                self.vals.insert(v, Val::Missing("a descriptor's address or format read as data"));
+                self.stale.insert(v);
+            }
+        }
+        Ok(true)
     }
 
     /// `s_load_dword*` from the program's constant table.
