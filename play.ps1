@@ -34,6 +34,8 @@ param(
     [ValidateRange(0,4096)]
     [int]$StorageTempMB = 0,    # estimated in-flight decode buffers; 0 disables
     [switch]$TwinScratch,       # share stencil twin copy scratch buffers
+    [ValidateSet('submit','late')]
+    [string]$PageList = 'submit', # DirectStorage page-list timing; late restores old behavior
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -76,6 +78,8 @@ $env:VICTORY_VRAM_EVICT = [string]$VramEvictPercent
 $env:VICTORY_DSTORAGE_SCRATCH_KB = [string]$StorageScratchKB
 $env:VICTORY_DSTORAGE_WORKERS = [string]$StorageWorkers
 $env:VICTORY_DSTORAGE_TEMP_MB = [string]$StorageTempMB
+$env:VICTORY_PAGE_LIST = $PageList
+Write-Host "DirectStorage page list: $PageList"
 $env:VICTORY_TWIN_SCRATCH = if ($TwinScratch) { '1' } else { '0' }
 if ($TwinScratch) { Write-Host "Shared stencil twin scratch: enabled." }
 if ($StorageTempMB -gt 0) { Write-Host "DirectStorage temporary admission budget: $StorageTempMB MiB." }
@@ -187,9 +191,9 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0 -or $StorageScratchKB -gt 0 -or $StorageWorkers -gt 0 -or $StorageTempMB -gt 0 -or $TwinScratch) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0 -or $StorageScratchKB -gt 0 -or $StorageWorkers -gt 0 -or $StorageTempMB -gt 0 -or $TwinScratch -or $PageList -eq 'late') {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } elseif ($MeshPrewarm -gt 0) { "MeshPrewarm$MeshPrewarm" } elseif ($Ambient -ge 0) { 'Ambient' } elseif ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) { 'VRAM' } elseif ($StorageScratchKB -gt 0) { 'StorageScratch' } elseif ($StorageWorkers -gt 0) { "StorageWorkers$StorageWorkers" } elseif ($StorageTempMB -gt 0) { "StorageTemp$StorageTempMB" } else { 'TwinScratch' }
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } elseif ($MeshPrewarm -gt 0) { "MeshPrewarm$MeshPrewarm" } elseif ($Ambient -ge 0) { 'Ambient' } elseif ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) { 'VRAM' } elseif ($StorageScratchKB -gt 0) { 'StorageScratch' } elseif ($StorageWorkers -gt 0) { "StorageWorkers$StorageWorkers" } elseif ($StorageTempMB -gt 0) { "StorageTemp$StorageTempMB" } elseif ($TwinScratch) { 'TwinScratch' } else { 'PageListLate' }
     if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
     if ($AlignedViews -and $mode -ne 'AlignedViews') { $mode += '+AlignedViews' }
     if ($DescriptorData -and $mode -ne 'DescriptorData') { $mode += '+DescriptorData' }
@@ -201,6 +205,7 @@ if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $Descriptor
     if ($StorageWorkers -gt 0 -and $mode -ne "StorageWorkers$StorageWorkers") { $mode += "+StorageWorkers$StorageWorkers" }
     if ($StorageTempMB -gt 0 -and $mode -ne "StorageTemp$StorageTempMB") { $mode += "+StorageTemp$StorageTempMB" }
     if ($TwinScratch -and $mode -ne 'TwinScratch') { $mode += '+TwinScratch' }
+    if ($PageList -eq 'late' -and $mode -ne 'PageListLate') { $mode += '+PageListLate' }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
