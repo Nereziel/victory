@@ -3003,6 +3003,36 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// A stable, independently aligned copy for an otherwise unrepresentable
+/// read-only buffer view (adapted from VIctory 86a5ed6). Do not evict a
+/// copy while a descriptor may still name it. Bound this experimental
+/// cache; the caller falls back to the ordinary path when it is full.
+pub(crate) fn aligned_view(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    const MAX_BYTES: u64 = 64 << 20;
+    const MAX_VIEWS: usize = 4096;
+    type Views = (u64, BTreeMap<(u64, u64), Arc<Shadow>>);
+    static VIEWS: Mutex<Views> = Mutex::new((0, BTreeMap::new()));
+    if len == 0 || len > MAX_BYTES || address.checked_add(len).is_none() {
+        return None;
+    }
+    let size = len.next_multiple_of(256);
+    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(copy) = views.1.get(&(address, len)) {
+        return Some(copy.clone());
+    }
+    if views.1.len() >= MAX_VIEWS || views.0 + size > MAX_BYTES {
+        return None;
+    }
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("aligned title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let copy = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    views.0 += size;
+    views.1.insert((address, len), copy.clone());
+    Some(copy)
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
