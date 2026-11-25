@@ -7,10 +7,11 @@
 param(
     [string]$Game = '',
     [switch]$Release,            # use target\release instead of target\diag
+    [switch]$Perf,               # use target\perf (ThinLTO performance build)
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
     [switch]$Warm,               # redo the shader warm-up even if this build already did it
-    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','HeapPlan','PipelineWindow','Balanced','Combined')]
+    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','HeapPlan','PipelineWindow','TextureIdle','TextureQueue','RyzenWorkers','Balanced','Combined')]
     [string]$Benchmark = ''      # optional A/B test mode, one variable at a time
 )
 $ErrorActionPreference = 'Stop'
@@ -22,10 +23,12 @@ if (-not (Test-Path $Game)) { throw "Game executable not found: $Game" }
 $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 Set-Content -Path $remember -Value $Game -Encoding utf8
 
-$build = if ($Release) { 'release' } else { 'diag' }
+if ($Release -and $Perf) { throw 'Choose either -Release or -Perf.' }
+$build = if ($Perf) { 'perf' } elseif ($Release) { 'release' } else { 'diag' }
 $exe = Join-Path $root "target\$build\victory.exe"
 if (-not (Test-Path $exe)) {
-    throw "Not built yet: $exe. Build first: cargo build --locked --profile diag -p victory --features diagnostics"
+    $command = if ($Perf) { 'cargo build --locked --profile perf -p victory' } elseif ($Release) { 'cargo build --locked --release -p victory' } else { 'cargo build --locked --profile diag -p victory --features diagnostics' }
+    throw "Not built yet: $exe. Build first: $command"
 }
 
 # Recommended preset (shadowdog00's, tested on an RTX 5060 Ti and an RX 6700 XT 12 GB).
@@ -51,6 +54,10 @@ if ($Benchmark) {
     $env:VICTORY_MAPPING_SHARDS = '0'
     $env:VICTORY_HEAP_PLAN_REUSE = '0'
     $env:VICTORY_PIPELINE_WAIT_SHARED = 'reserve'
+    $env:VICTORY_ADAPTIVE_TEXTURE_IDLE = '0'
+    foreach ($key in @('VICTORY_WIDE_THREADS','VICTORY_TEXTURE_THREADS','VICTORY_TEXTURE_QUEUE_MB','VICTORY_TEXTURE_QUEUE_MS')) {
+        Remove-Item "Env:$key" -ErrorAction SilentlyContinue
+    }
     if ($Benchmark -in @('AVX2','Balanced','Combined')) { $env:VICTORY_AVX2_MERGE = '1' }
     if ($Benchmark -in @('WideMerge','Combined')) { $env:VICTORY_WIDE_MERGE = '1' }
     if ($Benchmark -in @('WideRefresh','Combined')) { $env:VICTORY_WIDE_REFRESH = '1' }
@@ -59,6 +66,15 @@ if ($Benchmark) {
     if ($Benchmark -in @('MappingShards','Balanced','Combined')) { $env:VICTORY_MAPPING_SHARDS = '1' }
     if ($Benchmark -in @('HeapPlan','Balanced','Combined')) { $env:VICTORY_HEAP_PLAN_REUSE = '1' }
     if ($Benchmark -in @('PipelineWindow','Balanced','Combined')) { $env:VICTORY_PIPELINE_WAIT_SHARED = 'window' }
+    if ($Benchmark -in @('TextureIdle','Combined')) { $env:VICTORY_ADAPTIVE_TEXTURE_IDLE = '1' }
+    if ($Benchmark -in @('TextureQueue','Combined')) {
+        $env:VICTORY_TEXTURE_QUEUE_MB = '256'
+        $env:VICTORY_TEXTURE_QUEUE_MS = '100'
+    }
+    if ($Benchmark -in @('RyzenWorkers','Combined')) {
+        $env:VICTORY_WIDE_THREADS = '6'
+        $env:VICTORY_TEXTURE_THREADS = '4'
+    }
     # Balanced keeps the original VRAM limits and wide-copy settings;
     # Combined additionally tests the older wide and card-window switches.
     Write-Host "Benchmark mode: $Benchmark"
