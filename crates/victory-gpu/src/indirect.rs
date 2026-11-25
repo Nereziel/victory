@@ -63,9 +63,21 @@ void main(uint3 id : SV_DispatchThreadID) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
-    uint src_at = args_offset + id.x * stride;
+    if (id.x >= records) return;
     uint dst_at = id.x * stride;
+    if (id.x >= eff_count) {
+        // The scratch may still contain records from an earlier call.
+        // If ExecuteIndirect sees a larger count, its inactive tail must
+        // be harmless. Do not read source bytes or charge the budget.
+        if (kind <= 1u) {
+            dst_args.Store4(dst_at, uint4(0, 0, 0, 0));
+            if (kind == 1u) dst_args.Store(dst_at + 16u, 0u);
+        } else {
+            dst_args.Store3(dst_at, uint3(0, 0, 0));
+        }
+        return;
+    }
+    uint src_at = args_offset + id.x * stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -412,12 +424,17 @@ fn min_stride(kind: u32) -> Option<u32> {
 }
 
 /// Validates record alignment and returns the scratch byte size `stride * records`.
-fn validate_layout(
+pub(crate) fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
 ) -> Option<u64> {
     let min = min_stride(kind)?;
+    // The clamp dispatches 64 threads per group in one dimension.
+    // Reject impossible counts before allocating scratch or title copies.
+    if records.div_ceil(64) > 65_535 {
+        return None;
+    }
     if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
         return None;
     }
@@ -1136,6 +1153,8 @@ void main() {
         assert_eq!(validate_layout((0, 16, 1), 0, Some(6)), None);
         // Total byte size exceeding 32-bit ByteAddressBuffer indexing.
         assert_eq!(validate_layout((1, 20, u32::MAX), 0, None), None);
+        assert_eq!(validate_layout((2, 12, 65_535 * 64), 0, None), Some(65_535 * 64 * 12));
+        assert_eq!(validate_layout((2, 12, 65_535 * 64 + 1), 0, None), None);
     }
 
     /// WARP D3D12 execution test proving:
@@ -1341,8 +1360,10 @@ void main() {
             &clamped_words[12..18],
             &[65_535, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567]
         );
-        // Inactive slot 3 was never copied from `src_args`.
-        assert_ne!(clamped_words[21], 0xDEAD_BEEF);
+        // Inactive records have empty dispatch arguments, including in
+        // recycled scratch. Their stride padding is intentionally ignored.
+        assert_eq!(&clamped_words[18..21], &[0, 0, 0]);
+        assert_eq!(&clamped_words[24..27], &[0, 0, 0]);
     }
 
     /// WARP D3D12 test proving `BUDGET` saturates without 32-bit unsigned
