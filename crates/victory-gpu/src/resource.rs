@@ -108,6 +108,9 @@ pub(crate) struct AllocationInfo {
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
+// The only padding words in the console resource description.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 
 const BUFFER: u32 = 1;
 const TEXTURE_3D: u32 = 4;
@@ -2321,12 +2324,50 @@ pub(crate) fn first_mip(view: &[u32]) -> u32 {
     }
 }
 
+/// Ignore the two padding words in ResourceDesc when comparing placed
+/// textures. Adapted from Neptune (via skornuta/victory-fork). Keep every
+/// actual field, including alignment, sample quality and resource flags.
+/// VICTORY_PLACED_FILLER=1 restores the original byte-for-byte identity.
+#[cfg(windows)]
+pub(crate) fn placed_texture_key(desc: &[u32; 14]) -> [u32; 14] {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    placed_key(desc, *KEEP.get_or_init(|| {
+        std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")
+    }))
+}
+
+#[cfg(any(windows, test))]
+fn placed_key(desc: &[u32; 14], keep_padding: bool) -> [u32; 14] {
+    let mut key = *desc;
+    if !keep_padding {
+        key[1] = 0;
+        key[13] = 0;
+    }
+    key
+}
+
+#[cfg(test)]
+#[test]
+fn placed_texture_identity_ignores_only_padding() {
+    let desc = [3, 0, 0, 0, 512, 0, 512, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+    for i in 0..14 {
+        let mut other = desc;
+        other[i] ^= 1;
+        assert_eq!(
+            placed_key(&desc, false) == placed_key(&other, false),
+            matches!(i, 1 | 13), "word {i}"
+        );
+        assert_ne!(placed_key(&desc, true), placed_key(&other, true));
+    }
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let key = placed_texture_key(desc);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
+    if let Some(&r) = map.get(&(address, key)) {
         return Some(r as This);
     }
     // SAFETY: 56 bytes in the description's layout.
@@ -2347,7 +2388,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    map.insert((address, key), out as usize);
     resource(out)
         .host
         .placed
