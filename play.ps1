@@ -14,6 +14,7 @@ param(
     [switch]$GeometrySafe,       # diagnostic: longer, shared pipeline waits to preserve one-shot geometry
     [switch]$HeapSync,           # experimental: mirror raw CPU descriptor copies
     [switch]$AlignedViews,       # experimental: aligned copies for structured SRVs
+    [switch]$DescriptorData,     # experimental: translate size-only buffer descriptors
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -49,6 +50,8 @@ $env:VICTORY_HEAP_SYNC           = if ($HeapSync) { '1' } else { '0' }
 if ($HeapSync) { Write-Host 'HeapSync: experimental raw descriptor synchronization.' }
 $env:VICTORY_ALIGNED_VIEWS = if ($AlignedViews) { '1' } else { '0' }
 if ($AlignedViews) { Write-Host 'AlignedViews: experimental structured SRV copies.' }
+$env:VICTORY_DESC_DATA = if ($DescriptorData) { '1' } else { '0' }
+if ($DescriptorData) { Write-Host 'DescriptorData: experimental size-only buffer translation.' }
 $env:VICTORY_LATE_WAIT           = '3'
 $env:VICTORY_WIDE_BACK           = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
@@ -129,7 +132,7 @@ if ($NoFSR) {
 # and after every update or rebuild (a new exe can translate differently). Same settings as the
 # game, so it fills the entries the game looks up. -NoWarm skips it; -Warm forces it.
 $exeInfo = Get-Item $exe
-$stamp = "$($exeInfo.Length)|$($exeInfo.LastWriteTimeUtc.Ticks)|$env:VICTORY_SHADER_LOOP_LIMIT"
+$stamp = "$($exeInfo.Length)|$($exeInfo.LastWriteTimeUtc.Ticks)|$env:VICTORY_SHADER_LOOP_LIMIT|$env:VICTORY_DESC_DATA"
 $stampFile = Join-Path $root 'play.local.warm'
 $warmed = (Test-Path $stampFile) -and ((Get-Content $stampFile -Raw).Trim() -eq $stamp)
 if ($Warm -or (-not $NoWarm -and -not $warmed)) {
@@ -145,11 +148,12 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } else { 'AlignedViews' }
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } else { 'DescriptorData' }
     if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
     if ($AlignedViews -and $mode -ne 'AlignedViews') { $mode += '+AlignedViews' }
+    if ($DescriptorData -and $mode -ne 'DescriptorData') { $mode += '+DescriptorData' }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
