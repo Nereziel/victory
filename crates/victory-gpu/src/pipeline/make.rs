@@ -183,13 +183,16 @@ fn wait_budget() -> Duration {
     })
 }
 
-/// Whether the host's driver has been at `p` for longer than most take
-/// (one of the title's takes 85 s): no frame waits for it.
-fn slow(p: &Pending) -> bool {
-    // A pass a title runs once (it unpacks a model, say) is lost if its
-    // pipeline is not there; a draw comes again in the next frame.
-    let most = if p.computes() { 10 } else { 3 };
-    p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
+/// Skip unusually slow driver compiles only when the configured base
+/// budget is shorter than the usual cutoff. A deliberate longer budget
+/// (e.g. for one-shot geometry unpacking) must be respected.
+fn held_too_long(held: Duration, compute: bool, base: Duration) -> bool {
+    let cutoff = Duration::from_secs(if compute { 10 } else { 3 });
+    base < cutoff && held > cutoff
+}
+
+fn slow(p: &Pending, base: Duration) -> bool {
+    p.begun.get().is_some_and(|at| held_too_long(at.elapsed(), p.computes(), base))
 }
 
 /// What a frame may wait while a world loads: pipelines are asked for by
@@ -379,8 +382,8 @@ impl FrameWait {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     crate::zone!("pipeline wait");
-    let budget = wait_budget();
-    if budget.is_zero() || slow(p) {
+    let base = wait_budget();
+    if base.is_zero() || slow(p, base) {
         return;
     }
     // What was waited past the budget since the start, in milliseconds; the
@@ -389,7 +392,7 @@ fn wait(p: &Pending, frame: u64) {
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    let budget = base.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static FRAMES: [Mutex<FrameWait>; 2] = [const { Mutex::new(FrameWait::new()) }; 2];
@@ -405,7 +408,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !slow(p) {
+    while p.made.get().is_none() && !slow(p, base) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -416,7 +419,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
-    let past = waited.saturating_sub(wait_budget());
+    let past = waited.saturating_sub(base);
     past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
     {
         let mut state = frame_wait.lock().unwrap_or_else(|e| e.into_inner());
@@ -616,8 +619,21 @@ mod tests {
 
 #[cfg(test)]
 mod neptune_wait_tests {
-    use super::{FrameWait, Sharing, sharing_from};
+    use super::{FrameWait, Sharing, held_too_long, sharing_from};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn explicit_long_wait_is_not_cut_off_by_driver_age() {
+        let ms = Duration::from_millis;
+        let base = ms(500);
+        assert!(!held_too_long(ms(3_000), false, base));
+        assert!(held_too_long(ms(3_001), false, base));
+        assert!(!held_too_long(ms(10_000), true, base));
+        assert!(held_too_long(ms(10_001), true, base));
+        assert!(!held_too_long(ms(60_000), false, ms(3_000)));
+        assert!(!held_too_long(ms(60_000), true, ms(10_000)));
+        assert!(held_too_long(ms(60_000), true, ms(9_999)));
+    }
 
     #[test]
     fn overlapping_waiters_share_elapsed_time_not_reservations() {
