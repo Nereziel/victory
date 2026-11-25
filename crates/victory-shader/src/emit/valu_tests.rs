@@ -331,6 +331,25 @@ fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// Full-width unsigned conversion must round once, including values near
+/// half-way points and the largest u32 (VIctory #2186).
+#[test]
+fn unsigned_to_float_rounds_once() {
+    let shader = build_valu_cs(&[vop1(0x06, 0, vgpr(1))]);
+    let mut values = vec![0, 1, 0xFFFF, 0x10000, 0xDE84_975E, 0xFFFF_FF7F, u32::MAX];
+    for exponent in 24..32 {
+        let base = 1u32 << exponent;
+        let ulp = base >> 23;
+        for midpoint in [base + ulp / 2, base + ulp + ulp / 2] {
+            values.extend([midpoint - 1, midpoint, midpoint + 1]);
+        }
+    }
+    let cases: Vec<[u32; 4]> = values.into_iter().map(|v| [v, 0, 0, 0]).collect();
+    run_cases(&shader, &cases, |label, i, inputs, out| {
+        assert_eq!(out, (inputs[0] as f32).to_bits(), "{label} case {i}: {:08x}", inputs[0]);
+    });
+}
+
 #[test]
 fn packed_add_selects_halves_of_inline_constants() {
     // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
