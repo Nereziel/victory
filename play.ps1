@@ -29,6 +29,8 @@ param(
     [int]$VramEvictPercent = 0, # pressure-based idle texture eviction; 0 disables
     [ValidateRange(0,1024)]
     [int]$StorageScratchKB = 0, # retained KiB per DirectStorage scratch buffer
+    [ValidateRange(0,64)]
+    [int]$StorageWorkers = 0,   # DirectStorage worker count; 0 uses available parallelism
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -69,6 +71,8 @@ $env:VICTORY_TEXTURE_ROOM_PERCENT = [string]$TextureRoomPercent
 $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = [string]$TargetReserveMB
 $env:VICTORY_VRAM_EVICT = [string]$VramEvictPercent
 $env:VICTORY_DSTORAGE_SCRATCH_KB = [string]$StorageScratchKB
+$env:VICTORY_DSTORAGE_WORKERS = [string]$StorageWorkers
+if ($StorageWorkers -gt 0) { Write-Host "DirectStorage workers: $StorageWorkers." }
 if ($StorageScratchKB -gt 0) { Write-Host "DirectStorage scratch retention: $StorageScratchKB KiB per buffer." }
 if ($VramEvictPercent -gt 0) { Write-Host "VRAM eviction: above $VramEvictPercent percent." }
 if ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0) {
@@ -176,9 +180,9 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0 -or $StorageScratchKB -gt 0) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $DescriptorData -or $TextureHashEvery -ne 8 -or $MeshPrewarm -gt 0 -or $Ambient -ge 0 -or $TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0 -or $StorageScratchKB -gt 0 -or $StorageWorkers -gt 0) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } elseif ($MeshPrewarm -gt 0) { "MeshPrewarm$MeshPrewarm" } elseif ($Ambient -ge 0) { 'Ambient' } elseif ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) { 'VRAM' } else { 'StorageScratch' }
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } elseif ($HeapSync) { 'HeapSync' } elseif ($AlignedViews) { 'AlignedViews' } elseif ($DescriptorData) { 'DescriptorData' } elseif ($TextureHashEvery -ne 8) { "TextureHash$TextureHashEvery" } elseif ($MeshPrewarm -gt 0) { "MeshPrewarm$MeshPrewarm" } elseif ($Ambient -ge 0) { 'Ambient' } elseif ($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) { 'VRAM' } elseif ($StorageScratchKB -gt 0) { 'StorageScratch' } else { "StorageWorkers$StorageWorkers" }
     if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
     if ($AlignedViews -and $mode -ne 'AlignedViews') { $mode += '+AlignedViews' }
     if ($DescriptorData -and $mode -ne 'DescriptorData') { $mode += '+DescriptorData' }
@@ -187,6 +191,7 @@ if ($Benchmark -or $GeometrySafe -or $HeapSync -or $AlignedViews -or $Descriptor
     if ($Ambient -ge 0 -and $mode -ne 'Ambient') { $mode += '+Ambient' }
     if (($TextureRoomPercent -ne 90 -or $TargetReserveMB -gt 0 -or $VramEvictPercent -gt 0) -and $mode -ne 'VRAM') { $mode += '+VRAM' }
     if ($StorageScratchKB -gt 0 -and $mode -ne 'StorageScratch') { $mode += '+StorageScratch' }
+    if ($StorageWorkers -gt 0 -and $mode -ne "StorageWorkers$StorageWorkers") { $mode += "+StorageWorkers$StorageWorkers" }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
