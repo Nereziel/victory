@@ -566,26 +566,59 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// An immutable snapshot of the resolved physical destination. Keep its
+/// section references alive until DirectStorage completes (KLBF Lab).
+pub(crate) struct PageRuns {
+    runs: Vec<(Slice, usize)>,
+    within: usize,
+    len: usize,
+}
+
+pub(crate) fn resolve_pages(pages: &[usize], offset: usize, len: usize) -> Option<PageRuns> {
+    Some(PageRuns { runs: runs(pages, offset, len)?, within: offset % PAGE, len })
+}
+
+impl PageRuns {
+    pub(crate) fn window(&self) -> Option<PageWindow> {
+        let [(slice, n)] = self.runs.as_slice() else {
+            return None;
+        };
+        Some(PageWindow {
+            view: View::map(slice, *n)?,
+            within: self.within,
+            len: self.len,
+            slice: slice.clone(),
+        })
+    }
+
+    pub(crate) fn write(&self, data: &[u8]) -> bool {
+        if data.len() > self.len {
+            return false;
+        }
+        let (mut within, mut done) = (self.within, 0);
+        for (slice, n) in &self.runs {
+            if done == data.len() {
+                break;
+            }
+            let Some(mut view) = View::map(slice, *n) else {
+                return false;
+            };
+            let k = (n * PAGE - within).min(data.len() - done);
+            view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+            (within, done) = (0, done + k);
+            written(slice, *n);
+        }
+        done == data.len()
+    }
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
-    let Some(runs) = runs(pages, offset, data.len()) else {
-        return false;
-    };
-    let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
-            return false;
-        };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
-        (within, done) = (0, done + k);
-        written(slice, *n);
-    }
-    true
+    resolve_pages(pages, offset, data.len()).is_some_and(|runs| runs.write(data))
 }
 
 /// After writes into `n` pages from `slice` on through a view of our own:
@@ -635,16 +668,7 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
-        return None;
-    };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-        slice: slice.clone(),
-    })
+    resolve_pages(pages, offset, len)?.window()
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
