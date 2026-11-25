@@ -1649,11 +1649,19 @@ impl State {
             // From here on a host texture is made: not without room. The
             // slot stays due.
             if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+                // Trexies 310c6eb6: existing resident textures can still
+                // be refreshed when the budget prevents new allocations.
+                static REUPLOAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let enabled = *REUPLOAD.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_some_and(|v| v == "1"));
+                if !enabled || !heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle)) {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| tracing::info!("refreshing existing texture despite full VRAM budget"));
             }
             let making = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));

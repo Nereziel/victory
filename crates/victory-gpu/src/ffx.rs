@@ -408,7 +408,7 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
     let output = d.resources[OUTPUT].resource as This;
     let sane = |size: [u32; 2]| size.iter().all(|&n| (1..=16384).contains(&n));
     if !sane(d.render_size) || !sane(d.upscale_size)
-        || [title_list, input, output].iter().any(|p| (*p as usize) < 0x10000 || (*p as usize) % 8 != 0)
+        || [title_list, input, output].iter().any(|p| (*p as usize) < 0x10000 || !(*p as usize).is_multiple_of(8))
     {
         return ERROR_PARAMETER;
     }
@@ -429,7 +429,7 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
             continue;
         }
         let title = r.resource as This;
-        if (title as usize) < 0x10000 || (title as usize) % 8 != 0 { return fallback(); }
+        if (title as usize) < 0x10000 || !(title as usize).is_multiple_of(8) { return fallback(); }
         let Some(texture) = crate::resource::host_resource(title) else { return fallback(); };
         let state = if i == OUTPUT { HOST_UNORDERED_ACCESS } else { HOST_NON_PIXEL_SHADER_RESOURCE };
         if crate::host::legal_state(texture, state) != state { return fallback(); }

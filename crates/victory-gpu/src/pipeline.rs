@@ -901,7 +901,7 @@ mod tests {
         use_pipeline_cache(dir.clone());
         let dir = library::dir().unwrap().clone();
         let (ms, ps) = ([0x5au8; 11], [0xa5u8; 13]);
-        let mut stream = vec![0u8; 0x60];
+        let mut stream = [0u8; 0x60];
         let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
         // A mesh and a pixel shader, a sample mask, a topology and a
         // depth format: 0x60 bytes.
