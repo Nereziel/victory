@@ -155,6 +155,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// A store or atomic can reach raw title memory rather than a bound view.
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -213,6 +215,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -223,7 +226,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, stores_by_address })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -368,6 +371,30 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             _ => false,
         }
     })
+}
+
+/// Vertex 61d715e: distinguish writes through a descriptor from raw-address
+/// writes. Unknown code and indirect control flow retain the conservative
+/// answer. Include SMEM writes even though current raw SMEM lowering only
+/// accepts loads; this keeps the classification safe if stores are added.
+#[cfg(windows)]
+fn address_write(encoding: victory_shader::gfx10::Encoding, name: Option<&str>) -> bool {
+    use victory_shader::gfx10::Encoding;
+    match encoding {
+        Encoding::Flat | Encoding::Global | Encoding::Smem => name.is_none_or(|n|
+            (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")),
+        Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+        _ => name.is_none(),
+    }
+}
+
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::decode;
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| address_write(i.encoding, i.name()))
 }
 
 #[repr(C)]
@@ -784,6 +811,24 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn raw_address_writes_are_distinguished_from_descriptor_writes() {
+        use victory_shader::gfx10::Encoding::*;
+        for (encoding, name, expected) in [
+            (Mubuf, Some("buffer_store_dword"), false),
+            (Global, Some("global_load_dword"), false),
+            (Global, Some("global_store_dword"), true),
+            (Flat, Some("flat_atomic_add"), true),
+            (Flat, Some("scratch_store_dword"), false),
+            (Smem, Some("s_store_dword"), true),
+            (Sop1, Some("s_swappc_b64"), true),
+            (Mubuf, None, true),
+        ] {
+            assert_eq!(super::address_write(encoding, name), expected);
+        }
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
