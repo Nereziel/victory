@@ -1018,6 +1018,15 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+fn zero_mask_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ZERO_MASK.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ZERO_MASK").is_some_and(|v| v == "1"))
+}
+
 /// How the last program lowered on this thread stands to the host's waves,
 /// for reports: whether it is a console wave64 program run as two host
 /// waves of 32 (and then whether its groups have no upper half), whether
@@ -1039,6 +1048,8 @@ pub fn host_max_wave() -> u32 {
 
 #[cfg(test)]
 thread_local! {
+    pub(super) static TEST_ZERO_MASK: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
@@ -3008,6 +3019,11 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        // No lane contributes a bit to an identically empty mask. Either dword
+        // is zero even when the other half of a console wave skips this block.
+        if m == Bool::FALSE && zero_mask_on() {
+            return Ok(self.s.m.i32(0));
+        }
         // A mask that holds lanes outside EXEC where it is written (the complement of one,
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
