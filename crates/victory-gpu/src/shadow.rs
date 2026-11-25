@@ -1438,6 +1438,12 @@ mod wide_tests {
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Why merging under GPU writes required a settle (Kelvaroq 0042).
+static MERGE_FALLBACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub(crate) fn merge_fallback_stats() -> [u64; 4] {
+    MERGE_FALLBACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
 
 #[cfg(feature = "diagnostics")]
 thread_local! {
@@ -2492,6 +2498,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGE_FALLBACK[0].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -2504,6 +2511,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGE_FALLBACK[1].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2543,6 +2551,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        MERGE_FALLBACK[2].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2554,6 +2563,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGE_FALLBACK[3].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
