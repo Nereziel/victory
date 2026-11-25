@@ -12,6 +12,7 @@ param(
     [switch]$NoFSR,              # restore original linear upscale
     [switch]$NoIndirectWindow,   # diagnose missing geometry with per-record clamping
     [switch]$GeometrySafe,       # diagnostic: longer, shared pipeline waits to preserve one-shot geometry
+    [switch]$HeapSync,           # experimental: mirror raw CPU descriptor copies
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -43,6 +44,8 @@ $env:VICTORY_DISPLAY_MODE        = '1280x720'   # indoor walls draw with this
 $env:VICTORY_SHADER_LOOP_LIMIT   = '256'        # without it the GPU hangs in the open world
 $env:VICTORY_RELAY               = '2'
 $env:VICTORY_INDIRECT_WINDOW     = if ($NoIndirectWindow) { '0' } else { '1' }
+$env:VICTORY_HEAP_SYNC           = if ($HeapSync) { '1' } else { '0' }
+if ($HeapSync) { Write-Host 'HeapSync: experimental raw descriptor synchronization.' }
 $env:VICTORY_LATE_WAIT           = '3'
 $env:VICTORY_WIDE_BACK           = '1'
 $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
@@ -139,9 +142,10 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark -or $GeometrySafe) {
+if ($Benchmark -or $GeometrySafe -or $HeapSync) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    $mode = if ($GeometrySafe) { 'GeometrySafe' } else { $Benchmark }
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } elseif ($Benchmark) { $Benchmark } else { 'HeapSync' }
+    if ($HeapSync -and $mode -ne 'HeapSync') { $mode += '+HeapSync' }
     "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
