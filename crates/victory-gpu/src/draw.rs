@@ -1580,6 +1580,15 @@ impl State {
         } else {
             (PER_FRAME, SPAN)
         };
+        // KLBF Lab exposes both queue budgets. Retain this fork's normal
+        // and catch-up defaults unless the user requests an override.
+        static LIMITS: std::sync::OnceLock<(Option<u64>, Option<u64>)> = std::sync::OnceLock::new();
+        let (mb, ms) = *LIMITS.get_or_init(|| {
+            let read = |name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            (read("VICTORY_TEXTURE_QUEUE_MB"), read("VICTORY_TEXTURE_QUEUE_MS"))
+        });
+        let per_frame = mb.map_or(per_frame, |v| v.clamp(16, 1024) << 20);
+        let span = ms.map_or(span, |v| std::time::Duration::from_millis(v.clamp(10, 1500)));
         let began = std::time::Instant::now();
         let mut looked = 0u64;
         for (index, write) in due {
