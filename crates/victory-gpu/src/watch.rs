@@ -1142,7 +1142,34 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{shard_indices, title_memory_reading, title_memory_remapping, SHARDS};
+    use super::{SHARDS, mapping_shards, shard_indices, title_memory_reading, title_memory_reading_now,
+        title_memory_reading_range, title_memory_remapping, title_memory_remapping_range};
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Run explicitly with VICTORY_MAPPING_SHARDS=1 and --test-threads=1.
+    #[test]
+    fn disjoint_ranges_can_progress_during_a_remap() {
+        if !mapping_shards() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let here = 40usize << 24;
+        let there = 90usize << 24;
+        let change = title_memory_remapping_range(here, 64 << 10);
+        let reader = std::thread::spawn(move || {
+            assert!(title_memory_reading_now(here, 1).is_none());
+            assert!(title_memory_reading_now(there, 1).is_some());
+        });
+        reader.join().unwrap();
+        drop(change);
+        let read = title_memory_reading_range(here, 1);
+        let writer = std::thread::spawn(move || {
+            drop(title_memory_remapping_range(there, 1));
+        });
+        writer.join().unwrap();
+        drop(read);
+    }
 
     #[test]
     fn shard_ranges_are_sorted_and_cover_boundaries() {
@@ -1163,6 +1190,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
