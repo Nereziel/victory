@@ -654,7 +654,9 @@ impl<'a> Tracer<'a> {
         };
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
+                // VIctory #2154: the first dword of root constants is
+                // an offset/value, not the base of a descriptor table.
+                Some((p, 0)) if self.layout[p].root != RootType::Constants => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -2509,6 +2511,35 @@ pub(crate) mod tests {
             r.params.iter().map(|p| (p.1, p.2)).collect::<Vec<_>>(),
             [(0, 0), (0, 1)]
         );
+    }
+
+    #[test]
+    fn first_root_constant_is_a_dynamic_table_offset() {
+        let r = track_words(
+            &[
+                0xBE84_0302, // s_mov_b32 s4, s2
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0x0000_0020, // s_load_dwordx4 s[8:11], s[4:5], s0 offset:0x20
+                0x8006_0002, // s_add_u32 s6, s2, s0
+                0xBE87_0380, // s_mov_b32 s7, 0
+                0xF408_0303,
+                0xFA00_0040, // s_load_dwordx4 s[12:15], s[6:7], 0x40
+                0xE030_1000,
+                0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 offen
+                0xE070_1000,
+                0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+                S_ENDPGM,
+            ],
+            &[param(Constants, 0, 2), RootParam { slot: 1, ..param(Table, 2, 1) }],
+            HwStage::Cs,
+        );
+        let c0 = r.params.iter().find(|p| (p.1, p.2) == (0, 0)).unwrap().0;
+        assert_eq!(r.scalar, [
+            ((0, 2), Address { param: 1, offset: 0x20, dynamic: Some(c0) }),
+            ((0, 5), Address { param: 1, offset: 0x40, dynamic: Some(c0) }),
+        ]);
+        assert_eq!(r.descriptors.len(), 2);
     }
 
     #[test]
