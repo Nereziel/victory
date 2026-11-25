@@ -303,6 +303,7 @@ impl MeshBatch {
             [src_gpu, offsets_gpu, dst_gpu, budget],
             1,
         );
+        BOUNDED[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(Self {
             copy,
             offsets: offsets as usize,
@@ -318,6 +319,7 @@ impl MeshBatch {
     pub(crate) fn append(&mut self, offset: u32) -> (ID3D12Resource, u64) {
         let at = self.used;
         self.used += 1;
+        BOUNDED[8].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let offsets = self.offsets as *mut u32;
         // SAFETY: the mapped slice is owned by this open list, which is
         // recorded by one thread. accepts() bounds the slot in the slice.
@@ -576,7 +578,45 @@ fn record_clamp_as(
         [src_gpu, count_gpu, dst_gpu, budget],
         records.div_ceil(64),
     );
+    counted(kind, count.is_some(), how, records);
     true
+}
+
+/// Kelvaroq 0042, adapted to distinguish window, split and grouped mesh
+/// clamps. Count recorded GPU passes rather than failed allocation attempts.
+static BOUNDED: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+fn counted(kind: u32, count: bool, how: u32, records: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    BOUNDED[kind.min(3) as usize].fetch_add(1, Relaxed);
+    if count {
+        BOUNDED[4].fetch_add(1, Relaxed);
+    }
+    if how & AHEAD != 0 {
+        BOUNDED[5].fetch_add(1, Relaxed);
+    }
+    if how & IN_PARTS != 0 {
+        BOUNDED[6].fetch_add(1, Relaxed);
+    }
+    BOUNDED[9].fetch_add(u64::from(records), Relaxed);
+}
+
+/// Recorded clamp work per presented frame, not a GPU timing estimate.
+pub(crate) fn line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if frames <= 0.0 {
+        return;
+    }
+    let n = BOUNDED.each_ref().map(|c| c.swap(0, Relaxed) as f64 / frames);
+    if n[..4].iter().sum::<f64>() + n[7] > 0.0 {
+        tracing::info!(
+            draws = n[0], indexed = n[1], compute = n[2], mesh = n[3],
+            counted = n[4], windows = n[5], split = n[6],
+            mesh_batches = n[7], batched_mesh_records = n[8], records = n[9],
+            "indirect clamp passes per frame"
+        );
+    }
 }
 
 fn record_gpu_clamp(
