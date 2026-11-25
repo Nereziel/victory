@@ -445,6 +445,18 @@ pub(crate) fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// Root buffer descriptors do not carry a length. Check the real resource
+/// extent before recording shader reads or writes, including rebased views.
+fn buffer_span(width: u64, offset: u64, bytes: u64) -> bool {
+    offset <= width && bytes <= width - offset
+}
+
+fn resource_span(buffer: &ID3D12Resource, offset: u64, bytes: u64) -> bool {
+    // SAFETY: a live D3D12 resource.
+    let desc = unsafe { buffer.GetDesc() };
+    desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && buffer_span(desc.Width, offset, bytes)
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch
@@ -542,6 +554,17 @@ fn record_clamp_as(
     ) else {
         return false;
     };
+    let dst_bytes = if how & IN_PARTS != 0 {
+        u64::from(SPLIT) * PART_BYTES
+    } else {
+        bytes
+    };
+    if !resource_span(src, src_offset, bytes)
+        || !resource_span(dst, 0, dst_bytes)
+        || count.is_some_and(|(buffer, offset)| !resource_span(buffer, offset, 4))
+    {
+        return false;
+    }
     // SAFETY: live D3D12 buffer resources.
     let (src_base, dst_gpu) = unsafe { (src.GetGPUVirtualAddress(), dst.GetGPUVirtualAddress()) };
     if !src_base.is_multiple_of(4) || !dst_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
@@ -1132,6 +1155,16 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    #[test]
+    fn indirect_buffer_ranges_do_not_wrap_or_read_past_end() {
+        assert!(buffer_span(64, 52, 12));
+        assert!(!buffer_span(64, 56, 12));
+        assert!(!buffer_span(64, 65, 0));
+        assert!(!buffer_span(u64::MAX, u64::MAX - 3, 4));
+        assert!(buffer_span(u64::MAX, u64::MAX - 4, 4));
+        assert!(buffer_span(64, 64, 0));
     }
 
     #[test]
