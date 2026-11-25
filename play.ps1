@@ -11,6 +11,7 @@ param(
     [switch]$FSR,                # optional PC FidelityFX SDK upscaler
     [switch]$NoFSR,              # restore original linear upscale
     [switch]$NoIndirectWindow,   # diagnose missing geometry with per-record clamping
+    [switch]$GeometrySafe,       # diagnostic: longer, shared pipeline waits to preserve one-shot geometry
     [string]$FsrDir = '',        # SDK signedbin directory
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
@@ -28,6 +29,7 @@ $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 Set-Content -Path $remember -Value $Game -Encoding utf8
 
 if ($Release -and $Perf) { throw 'Choose either -Release or -Perf.' }
+if ($GeometrySafe -and $Benchmark) { throw 'Choose -GeometrySafe or -Benchmark for an isolated test.' }
 $build = if ($Perf) { 'perf' } elseif ($Release) { 'release' } else { 'diag' }
 $exe = Join-Path $root "target\$build\victory.exe"
 if (-not (Test-Path $exe)) {
@@ -88,6 +90,15 @@ if ($Benchmark) {
     # Combined additionally tests the older wide and card-window switches.
     Write-Host "Benchmark mode: $Benchmark"
 }
+if ($GeometrySafe) {
+    # Keep the rest of the normal preset. A 10 s base disables the old
+    # 3 s graphics / 10 s compute cutoff; the existing loading allowance
+    # can raise compute to 12 s. Window sharing avoids dropping another
+    # recording thread's pipeline merely because a thread is waiting.
+    $env:VICTORY_PIPELINE_WAIT_MS = '10000'
+    $env:VICTORY_PIPELINE_WAIT_SHARED = 'window'
+    Write-Host 'GeometrySafe: longer pipeline waits; expect loading stalls.'
+}
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 
 # FSR is independent of the benchmark profile.
@@ -128,9 +139,10 @@ if ($Warm -or (-not $NoWarm -and -not $warmed)) {
 
 $log = Join-Path $root ('logs\' + (Get-Date -Format 'yyyyMMdd_HHmmss_fff'))
 New-Item -ItemType Directory -Force $log | Out-Null
-if ($Benchmark) {
+if ($Benchmark -or $GeometrySafe) {
     $env:VICTORY_FRAMETIME_DUMP = Join-Path $log 'frametime.csv'
-    "benchmark=$Benchmark" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
+    $mode = if ($GeometrySafe) { 'GeometrySafe' } else { $Benchmark }
+    "benchmark=$mode" | Set-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
     Get-ChildItem Env:VICTORY_* | Sort-Object Name | ForEach-Object {
         "$($_.Name)=$($_.Value)"
     } | Add-Content (Join-Path $log 'benchmark.txt') -Encoding utf8
