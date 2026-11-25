@@ -91,6 +91,13 @@ opt-level = 2
 [profile.release]
 debug = "line-tables-only"
 
+# Optional CPU-oriented build, separate from the normal release artifacts.
+# Inspired by Belobug's ThinLTO/codegen-units tuning; benchmark before using.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.
