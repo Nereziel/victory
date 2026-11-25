@@ -975,8 +975,10 @@ impl State {
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
-            if made.iter().any(|m| m.1 == u32::MAX) {
-                once!("a draw whose descriptor table found no free slots is dropped");
+            if let Some(&(slot, _)) = made.iter().find(|m| m.1 == u32::MAX) {
+                once!(slot, "a draw whose required fresh descriptor table could not be made is dropped");
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(format!("fresh descriptor table unavailable at root slot {slot}"));
                 return false;
             }
             // What the shader stores through root views and raw addresses is
@@ -2108,12 +2110,15 @@ impl State {
                 .filter(|u| u.slot == slot)
                 .collect();
             let Some(heap) = self.heap_of(table) else {
+                made.push((slot, u32::MAX));
                 continue;
             };
             if heap.samplers() || (table - heap.start) % 32 != 0 {
+                made.push((slot, u32::MAX));
                 continue;
             }
             let Some(host) = heap.host() else {
+                made.push((slot, u32::MAX));
                 continue;
             };
             let mut selected: Vec<u32> = indexed
@@ -2143,7 +2148,11 @@ impl State {
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
+                // This table was selected for rebuilding because the
+                // title's own slots cannot serve the shader. Falling
+                // back to the original base risks an invalid GPU view.
                 once!(slot, n, "fresh descriptor table exceeds the available span");
+                made.push((slot, u32::MAX));
                 continue;
             }
             // The table and what its entries hold (record words).
