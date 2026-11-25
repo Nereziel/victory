@@ -2515,7 +2515,15 @@ impl State {
             ));
             return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        // A zero-count ExecuteIndirect does no work. Avoid creating a
+        // scratch allocation or recording an empty clamp for it.
+        if max == 0 {
+            return true;
+        }
+        let Some(len) = crate::indirect::validate_layout((kind, stride, max), arguments, count) else {
+            why("invalid indirect argument layout or dispatch size");
+            return false;
+        };
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
