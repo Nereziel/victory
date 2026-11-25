@@ -333,6 +333,14 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     Some(x) => one(uni.get(&x).copied().unwrap_or(Sym::Uni(x))),
                     None => one(Sym::Unknown),
                 },
+                // VIctory #2493: these inline constants have f16 bits
+                // for v_add_f16, not the generic f32 representation.
+                Operand::Const(c @ 240..=248) if name == "v_add_f16" => {
+                    let half = [
+                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                    ][usize::from(c - 240)];
+                    one(Sym::K(half))
+                }
                 Operand::Const(c) => one(crate::resource::inline(c).map_or(Sym::Unknown, Sym::K)),
                 Operand::Literal(x) => one(Sym::K(x)),
                 _ => one(Sym::Unknown),
@@ -952,6 +960,16 @@ mod tests {
         };
         let (found, want) = shape(&words(pairs, quads));
         assert_eq!(found, Some(want));
+        // A nonzero inline f16 add must never be elided as an identity.
+        // Insert it before the balanced reduction tree.
+        let mut zero = words(pairs, quads).to_vec();
+        zero.insert(3, vop2(1, 0x32, 128, 1));
+        assert_eq!(shape(&zero).0, Some(want));
+        for code in 240..=248 {
+            let mut nonzero = zero.clone();
+            nonzero[3] = vop2(1, 0x32, code, 1);
+            assert_eq!(shape(&nonzero).0, None, "inline f16 code {code}");
+        }
         // lanes two apart first, neighbours second: every lane counted once, but
         // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
         let (found, _) = shape(&words(quads, pairs));
