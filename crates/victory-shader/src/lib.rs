@@ -47,6 +47,8 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/bitcode.rs"),
         include_str!("emit/bitcode/census.rs"),
         include_str!("emit/bitcode/opt.rs"),
+        include_str!("emit/bitcode/paired.rs"),
+        include_str!("emit/paired_tests.rs"),
         include_str!("emit/container.rs"),
         include_str!("emit/diff_tests.rs"),
         include_str!("emit/host.rs"),
