@@ -418,7 +418,6 @@ fn wave(s: &mut Shader, b: usize, f: u32, opcode: i64, args: &[V], vals: &Values
                 (_, 2 | 3) => {
                     let (name, min, max) = match s.m.types[ty.0 as usize] {
                         TypeDef::Float => ("binary.f32", 36, 35),
-                        TypeDef::Double => ("binary.f64", 36, 35),
                         TypeDef::Int(32) if s.m.int_value(args[3]) == Some(1) => {
                             ("binary.i32", 40, 39)
                         }
