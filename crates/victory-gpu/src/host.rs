@@ -18,6 +18,27 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+/// Mesh arguments are three dwords loaded by a raw GPU descriptor.
+fn mesh_argument_fits(width: u64, offset: u32) -> bool {
+    let stride = u64::from(crate::indirect::MESH_STRIDE);
+    offset.is_multiple_of(4)
+        && offset.checked_add(crate::indirect::MESH_STRIDE - 1).is_some()
+        && u64::from(offset) <= width
+        && stride <= width - u64::from(offset)
+}
+
+#[cfg(test)]
+#[test]
+fn mesh_arguments_fit_the_actual_buffer() {
+    assert!(mesh_argument_fits(64, 52));
+    assert!(!mesh_argument_fits(64, 56));
+    assert!(!mesh_argument_fits(64, 51));
+    assert!(!mesh_argument_fits(11, 0));
+    assert!(mesh_argument_fits(12, 0));
+    assert!(!mesh_argument_fits(u64::MAX, u32::MAX - 3));
+    assert!(mesh_argument_fits(u64::MAX, u32::MAX - 11));
+}
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -5952,6 +5973,15 @@ impl HostList {
         src: &ID3D12Resource,
         offset: u32,
     ) -> Option<(ID3D12Resource, u64, bool)> {
+        // Unlike a descriptor table, a root SRV supplies no bounds.
+        // Check every appended record, not just the first of the batch.
+        // SAFETY: the caller holds a live D3D12 resource.
+        let desc = unsafe { src.GetDesc() };
+        if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+            || !mesh_argument_fits(desc.Width, offset)
+        {
+            return None;
+        }
         let mut slot = self.mesh_batch.lock().unwrap_or_else(|e| e.into_inner());
         let opened = !slot.as_ref().is_some_and(|batch| batch.accepts(copy));
         if opened {
