@@ -6957,11 +6957,8 @@ impl Meter {
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
-        #[cfg(feature = "diagnostics")]
-        let slow = crate::watch::slow_asks();
-        // Over the same frames as the counts above.
-        #[cfg(feature = "diagnostics")]
-        let drops = crate::pipeline::take_drops();
+        // Keep the detailed diagnostic counters until the five-second
+        // report. The one-second frametime CSV still takes its own counters.
         // `VICTORY_FRAMETIME_DUMP`: one row per summary interval, with the
         // buckets above and the worst/mean frame measured at each present.
         if crate::frametime::enabled() {
@@ -7011,6 +7008,10 @@ impl Meter {
         }
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let report_frames = std::mem::take(&mut self.copy_stats_frames).max(1) as f64;
+            #[cfg(feature = "diagnostics")]
+            let slow = crate::watch::slow_asks();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -7050,8 +7051,8 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
-                slow[0] as f64 / frames,
-                slow[1] as f64 / 1e3 / frames,
+                slow[0] as f64 / report_frames,
+                slow[1] as f64 / 1e3 / report_frames,
                 slow[2] as f64 / 1e3
             );
             if crate::shadow::cards() {
@@ -7106,12 +7107,22 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
+                crate::copystat::log(report_frames);
+                let drops = crate::pipeline::take_drops();
+                let total = drops.iter().map(|(_, n)| *n).sum::<u64>();
+                if total != 0 {
                     tracing::info!(
-                        "dropped {:.1}/frame without a host pipeline: {why}",
-                        *n as f64 / frames
+                        frames = report_frames as u64,
+                        dropped = total,
+                        reasons = drops.len(),
+                        "pipeline drop reasons over the reporting interval"
                     );
+                    for (why, n) in drops.iter().take(40) {
+                        tracing::info!(
+                            "dropped {:.1}/frame without a host pipeline: {why}",
+                            *n as f64 / report_frames
+                        );
+                    }
                 }
             }
         }
