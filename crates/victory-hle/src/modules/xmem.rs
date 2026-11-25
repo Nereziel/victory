@@ -1443,6 +1443,20 @@ mod tests {
     }
 
     #[test]
+    fn resolved_pages_do_not_follow_a_reused_page_list() {
+        let (a, b) = (allocate(1), allocate(1));
+        let mut list = [a[0]];
+        let snapshot = resolve_pages(&list, 3, 4).expect("resolved destination");
+        list[0] = b[0];
+        assert!(snapshot.write(&[1, 2, 3, 4]));
+        assert_eq!(&page_bytes(a[0])[3..7], &[1, 2, 3, 4]);
+        assert_eq!(&page_bytes(list[0])[3..7], &[0; 4]);
+        drop(snapshot);
+        assert_eq!(XMemFreePhysicalPages(1, a.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
     fn page_windows_cover_one_run_in_place() {
         let (a, b) = (allocate(3), allocate(1));
         let mut window = page_window(&a, PAGE + 3, PAGE).expect("one run");
