@@ -10,7 +10,7 @@ param(
     [switch]$SeriesX,            # run as the larger console (about half the frame rate of the default Series S mode)
     [switch]$NoWarm,             # skip the shader warm-up even if this build has not done it
     [switch]$Warm,               # redo the shader warm-up even if this build already did it
-    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','Combined')]
+    [ValidateSet('Baseline','AVX2','WideMerge','WideRefresh','CardWindows','ReBAR','MappingShards','Combined')]
     [string]$Benchmark = ''      # optional A/B test mode, one variable at a time
 )
 $ErrorActionPreference = 'Stop'
@@ -19,6 +19,7 @@ $remember = Join-Path $root 'play.local.txt'
 if (-not $Game -and (Test-Path $remember)) { $Game = (Get-Content $remember -Raw).Trim() }
 if (-not $Game) { throw 'Pass -Game "<path to game_scarlett_master.exe>" once.' }
 if (-not (Test-Path $Game)) { throw "Game executable not found: $Game" }
+$Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 Set-Content -Path $remember -Value $Game -Encoding utf8
 
 $build = if ($Release) { 'release' } else { 'diag' }
@@ -46,10 +47,14 @@ if ($Benchmark) {
     $env:VICTORY_WIDE_MERGE = '0'
     $env:VICTORY_WIDE_REFRESH = '0'
     $env:VICTORY_CARD_WINDOWS_MB = '0'
+    $env:VICTORY_GPU_UPLOAD_SCRATCH = '0'
+    $env:VICTORY_MAPPING_SHARDS = '0'
     if ($Benchmark -in @('AVX2','Combined')) { $env:VICTORY_AVX2_MERGE = '1' }
     if ($Benchmark -in @('WideMerge','Combined')) { $env:VICTORY_WIDE_MERGE = '1' }
     if ($Benchmark -in @('WideRefresh','Combined')) { $env:VICTORY_WIDE_REFRESH = '1' }
     if ($Benchmark -in @('CardWindows','Combined')) { $env:VICTORY_CARD_WINDOWS_MB = '1024' }
+    if ($Benchmark -in @('ReBAR','Combined')) { $env:VICTORY_GPU_UPLOAD_SCRATCH = '1' }
+    if ($Benchmark -in @('MappingShards','Combined')) { $env:VICTORY_MAPPING_SHARDS = '1' }
     Write-Host "Benchmark mode: $Benchmark"
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
