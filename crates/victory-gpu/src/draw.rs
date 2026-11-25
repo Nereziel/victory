@@ -1810,6 +1810,29 @@ impl State {
         });
     }
 
+    /// Replace the indirect diffuse light only after its known resolve shader.
+    fn ambient(&mut self, list: &HostList, p: &HostPipeline) {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else { return };
+        let Some(u) = stage.translated().used.iter().find(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table
+                && (u.slot, u.table_offset_dwords) == crate::ambient::LIGHT
+        }) else { return };
+        let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else { return };
+        let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { return };
+        if self.heap_of(handle).is_none() { return; }
+        let Some(View::Unordered(resource, _, Some(words))) = crate::descriptor::view(handle) else { return };
+        // Only a plain 2D UAV of mip zero, not a slice or another format.
+        if words[1] != D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32 || words[2] != 0 || words[3] != 0
+            || crate::resource::pc_format(words[0]) != 42 { return; }
+        if crate::ambient::raise(list, resource as This) {
+            // The pass changed the bound heap, root signature and PSO.
+            // Force the next title draw or dispatch to bind all of them.
+            self.host_heaps = [0; 2];
+            self.host_roots = [0; 2];
+            self.host_pipeline = 0;
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         list.end_mesh_batch();
@@ -1876,6 +1899,9 @@ impl State {
             }
             // SAFETY: an open list with everything set.
             _ => unsafe { list.list.Dispatch(x, y, z) },
+        }
+        if x != 0 && y != 0 && z != 0 {
+            self.ambient(list, p);
         }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
