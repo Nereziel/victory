@@ -343,6 +343,11 @@ struct Lanes {
     /// Bytes of staging held by running requests, and the limit.
     staged: u64,
     staging: u64,
+    /// Optional host-side budget, separate from the console's staging size.
+    temporary: u64,
+    temporary_limit: u64,
+    temporary_peak: u64,
+    temporary_waits: u64,
     /// A start waited for staging space since the last finish.
     starved: bool,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
@@ -389,6 +394,7 @@ struct Job {
     request: Request,
     pages: Option<super::xmem::PageRuns>,
     staging: u64,
+    temporary: u64,
 }
 
 // SAFETY: as for `Lane`.
@@ -408,6 +414,12 @@ fn scheduler() -> Option<&'static Scheduler> {
                     next_seq: 0,
                     staged: 0,
                     staging: STAGING,
+                    temporary: 0,
+                    temporary_limit: std::env::var("VICTORY_DSTORAGE_TEMP_MB").ok()
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map_or(0, |v| v.min(4096) << 20),
+                    temporary_peak: 0,
+                    temporary_waits: 0,
                     starved: false,
                     clock: [0; 3],
                     now: 0,
@@ -547,6 +559,9 @@ impl Lanes {
                 busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
                 reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
                 staging_waits = std::mem::take(&mut self.refused),
+                temporary_waits = std::mem::take(&mut self.temporary_waits),
+                temporary_peak_mb = self.temporary_peak >> 20,
+                temporary_limit_mb = self.temporary_limit >> 20,
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
@@ -554,6 +569,7 @@ impl Lanes {
                 elapsed.as_secs_f64()
             );
             self.done = Default::default();
+            self.temporary_peak = self.temporary;
             self.bcpack = Default::default();
             self.since = None;
         }
@@ -572,14 +588,28 @@ impl Lanes {
         let lane = self.lanes.get_mut(&id)?;
         let (_, request, _) = lane.reads.front()?;
         let staging = staging_bytes(request);
+        let temporary = if self.temporary_limit != 0 {
+            temporary_bytes(request)
+        } else { 0 };
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
+        // Preserve the selected lane's ordering. An oversized request can
+        // run when no other charged job is active, so it cannot deadlock.
+        if temporary != 0 && self.temporary != 0
+            && self.temporary.saturating_add(temporary) > self.temporary_limit
+        {
+            self.starved = true;
+            self.temporary_waits += 1;
+            return None;
+        }
         let (seq, request, pages) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
+        self.temporary += temporary;
+        self.temporary_peak = self.temporary_peak.max(self.temporary);
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -591,11 +621,13 @@ impl Lanes {
             request,
             pages,
             staging,
+            temporary,
         })
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        self.temporary -= job.temporary;
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -697,6 +729,28 @@ fn staging_bytes(request: &Request) -> u64 {
     }
 }
 
+/// Conservative estimate of temporary buffer lengths for one request.
+/// A physical-page destination may need a full fallback buffer even when
+/// a contiguous direct window is expected, so always account for it.
+/// Idle retained capacities, decoder-internal allocations and page-list
+/// metadata are outside this admission estimate.
+fn temporary_bytes(request: &Request) -> u64 {
+    let options = request.options;
+    let compressed = options & (ZLIB | BCPACK) != 0;
+    let mut bytes = if compressed && options & MEMORY_SOURCE == 0 {
+        u64::from(request.source_size)
+    } else { 0 };
+    if options & ZLIB != 0 && options & BCPACK != 0 {
+        bytes += u64::from(request.intermediate_size);
+    }
+    if options & PAGE_DESTINATION != 0 {
+        bytes += u64::from(if compressed { request.destination_size } else {
+            request.source_size.min(request.destination_size)
+        });
+    }
+    bytes
+}
+
 /// Ends a queue: what was not started is dropped, and this waits for the
 /// reads already running (they write title memory).
 fn close_lane(id: u64) {
@@ -711,6 +765,8 @@ fn close_lane(id: u64) {
     lane.unsubmitted.clear();
     lane.reads.clear();
     lane.statuses.clear(); // releases their arrays
+    // Removing a blocked queue head can expose runnable work elsewhere.
+    scheduler.work.notify_all();
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -1450,6 +1506,10 @@ mod tests {
             next_seq: 0,
             staged: 0,
             staging,
+            temporary: 0,
+            temporary_limit: 0,
+            temporary_peak: 0,
+            temporary_waits: 0,
             starved: false,
             clock: [0; 3],
             now: 0,
@@ -1512,6 +1572,42 @@ mod tests {
         assert!(l.start().is_none());
         l.finish(&second, Ok(()));
         assert!(l.start().is_some());
+    }
+
+    #[test]
+    fn temporary_budget_charges_decode_and_page_fallback() {
+        let mut r = request(ZLIB | BCPACK | PAGE_DESTINATION,
+            std::ptr::null_mut(), 300, std::ptr::null(), 0, 60);
+        r.intermediate_size = 120;
+        assert_eq!(temporary_bytes(&r), 480);
+        r.options |= MEMORY_SOURCE;
+        assert_eq!(temporary_bytes(&r), 420);
+        r.options = PAGE_DESTINATION;
+        assert_eq!(temporary_bytes(&r), 60);
+        r.options = 0;
+        assert_eq!(temporary_bytes(&r), 0);
+
+        let mut l = lanes(STAGING);
+        l.temporary_limit = 100;
+        l.lanes.insert(0, Lane::new(0, 64));
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE | PAGE_DESTINATION, 60);
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE | PAGE_DESTINATION, 60);
+        read(&mut l, 0, ZLIB | MEMORY_SOURCE | PAGE_DESTINATION, 500);
+        l.submit(0);
+        let first = l.start().unwrap();
+        assert_eq!(first.staging, 0);
+        assert_eq!(first.temporary, 60);
+        assert!(l.start().is_none());
+        l.finish(&first, Err(INVALID_DATA));
+        let second = l.start().unwrap();
+        assert!(l.start().is_none());
+        l.finish(&second, Ok(()));
+        let oversized = l.start().unwrap();
+        assert_eq!(oversized.temporary, 500);
+        l.finish(&oversized, Ok(()));
+        assert_eq!(l.temporary, 0);
+        assert_eq!(l.temporary_peak, 500);
+        assert_eq!(l.temporary_waits, 2);
     }
 
     #[test]
