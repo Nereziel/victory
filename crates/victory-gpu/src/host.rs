@@ -4711,6 +4711,11 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        // Raw-copied descriptors are only mirrored when no earlier GPU
+        // submission can still be reading the host heap.
+        if !behind {
+            crate::descriptor::sync_heaps();
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
