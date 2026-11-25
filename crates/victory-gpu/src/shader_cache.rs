@@ -11,8 +11,8 @@
 //! are ignored anyway).
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -111,10 +111,11 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 /// The cache entry's converter: the build and the container in, the
-/// encoded translation out. `ran` tells a miss from a hit.
+/// encoded translation out. Keep the translation itself so a cache miss
+/// needs no disk readback and a failed write does not drop a valid shader.
 struct Translate<F> {
     translate: F,
-    ran: AtomicBool,
+    made: Mutex<Option<Result<HostShader, String>>>,
 }
 
 impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
@@ -126,9 +127,10 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         1
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
-        let shader = (self.translate)(&input[32..]).map_err(anyhow::Error::msg)?;
-        Ok(encode(&shader))
+        let made = (self.translate)(&input[32..]);
+        let encoded = made.as_ref().map(encode).map_err(|e| anyhow::Error::msg(e.clone()));
+        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(made);
+        encoded
     }
 }
 
@@ -141,20 +143,31 @@ fn cached(
     let input = [&build[..], container].concat();
     let converter = Translate {
         translate,
-        ran: AtomicBool::new(false),
+        made: Mutex::new(None),
     };
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
+        let result = cache.get_or_convert(&converter, &input);
+        let made = converter.made.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // VIctory #2055, adapted to our success-only cache encoding.
+        if let Some(shader) = made {
+            MISSES.fetch_add(1, Ordering::Relaxed);
+            match &result {
+                Ok(path) => tracing::debug!(path = %path.display(), "shader translated and cached"),
+                Err(e) if shader.is_ok() => tracing::debug!(error = %e, "shader translated, cache write failed"),
+                Err(_) => {}
+            }
+            return shader;
+        }
+        let path = match result {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::debug!(error = %e, "shader cache unavailable; translating without cache");
+                break;
+            }
+        };
         if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
-                (&MISSES, "translated and cached")
-            } else {
-                (&HITS, "from the cache")
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(path = %path.display(), "shader {what}");
+            HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(path = %path.display(), "shader from the cache");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
@@ -401,6 +414,22 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn cache_write_failure_does_not_drop_a_valid_shader() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache = Cache::open(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::write(&root, b"not a directory").unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        assert_eq!(cached(&cache, &[7; 32], b"container", translate), Ok(shader()));
+        assert_eq!(runs.load(Ordering::Relaxed), 1);
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
