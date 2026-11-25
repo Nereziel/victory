@@ -627,59 +627,95 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+// The original global lock remains the default. Experimental mode shards
+// virtual addresses in 16 MiB spans, modulo 256, in a fixed lock order.
+// Adapted from JoshuuDev/victory-amd@6c5e9635.
+const SHARDS: usize = 256;
+const SHARD_BITS: u32 = 24;
+static MAPPING: [std::sync::RwLock<()>; SHARDS] =
+    [const { std::sync::RwLock::new(()) }; SHARDS];
 
-/// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]), and since when.
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
+pub(crate) fn mapping_shards() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPING_SHARDS").is_some_and(|v| v == "1"))
+}
 
-/// Since the last frame line: changes of what title memory shows by the
-/// runtime, the microseconds they waited for reads in place to end, and
-/// the microseconds they held title memory still. Texture refreshes wait
-/// up to 1.4 s a frame for title memory to hold still in the opening
-/// cutscene (run fb_stamps1); these say how long it is held, and how often.
+fn shard_indices(at: usize, len: usize, enabled: bool) -> Vec<usize> {
+    if !enabled {
+        return vec![0];
+    }
+    if len == 0 {
+        return (0..SHARDS).collect();
+    }
+    let first = at >> SHARD_BITS;
+    let last = at.saturating_add(len - 1) >> SHARD_BITS;
+    if last - first + 1 >= SHARDS {
+        return (0..SHARDS).collect();
+    }
+    let mut indices: Vec<usize> = (first..=last).map(|s| s % SHARDS).collect();
+    indices.sort_unstable();
+    indices
+}
+
+/// Holds every mapping lock covering a remap, including temporarily unmapped
+/// parts of adjacent views.
+pub struct Remapping {
+    _guards: Vec<std::sync::RwLockWriteGuard<'static, ()>>,
+    since: std::time::Instant,
+}
+
+/// Counts remappings, wait microseconds, and hold microseconds.
 pub(crate) static REMAPPINGS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        REMAPPINGS[2].fetch_add(self.1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        REMAPPINGS[2].fetch_add(self.since.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
+/// Hold all mapping locks for callers without an exact range.
 pub fn title_memory_remapping() -> Remapping {
+    title_memory_remapping_range(0, 0)
+}
+
+/// Hold mapping locks for the full range affected by a remap.
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
     let asked = std::time::Instant::now();
-    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let guards = shard_indices(at, len, mapping_shards()).into_iter()
+        .map(|i| MAPPING[i].write().unwrap_or_else(|e| e.into_inner()))
+        .collect();
     let now = std::time::Instant::now();
     REMAPPINGS[0].fetch_add(1, Relaxed);
     REMAPPINGS[1].fetch_add((now - asked).as_micros() as u64, Relaxed);
-    Remapping(held, now)
+    Remapping { _guards: guards, since: now }
 }
 
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Vec<std::sync::RwLockReadGuard<'static, ()>>);
 
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
+/// Hold all mapping locks. Do not acquire another mapping guard on this thread.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(0, 0)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// Hold only the locks covering the bytes read in place.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    Reading(shard_indices(at, len, mapping_shards()).into_iter()
+        .map(|i| MAPPING[i].read().unwrap_or_else(|e| e.into_inner()))
+        .collect())
+}
+
+/// Try the range without waiting. Partial acquisitions are released on failure.
+pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    let mut guards = Vec::new();
+    for i in shard_indices(at, len, mapping_shards()) {
+        match MAPPING[i].try_read() {
+            Ok(guard) => guards.push(guard),
+            Err(std::sync::TryLockError::Poisoned(e)) => guards.push(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
     }
+    Some(Reading(guards))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1106,7 +1142,19 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{shard_indices, title_memory_reading, title_memory_remapping, SHARDS};
+
+    #[test]
+    fn shard_ranges_are_sorted_and_cover_boundaries() {
+        let mb = 1usize << 20;
+        assert_eq!(shard_indices(0, 0, false), vec![0]);
+        assert_eq!(shard_indices(90 << 24, mb, false), vec![0]);
+        assert_eq!(shard_indices(0, 0, true).len(), SHARDS);
+        assert_eq!(shard_indices(15 * mb, 2 * mb, true), vec![0, 1]);
+        assert_eq!(shard_indices(255 << 24, 32 * mb, true), vec![0, 255]);
+        assert_eq!(shard_indices(0, 256 << 24, true).len(), SHARDS);
+        assert_eq!(shard_indices(usize::MAX - 1, 64, true), vec![255]);
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
